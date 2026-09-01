@@ -16,8 +16,19 @@ Steps (see CLAUDE.md section 5 + risk area 3):
   4. Per neighbourhood (LEFT join from all 158 polygons; zero-stop kept):
        stop_count, neighbourhood_frequency = SUM(trips_per_hour),
        area_km2, neighbourhood_stop_density = stop_count / area_km2,
-       raw_access = 0.6*frequency + 0.4*stop_density,
-       access_score = min-max(raw_access) over all 158 -> 0..1
+       freq_norm    = min-max(neighbourhood_frequency)     -> 0..1
+       density_norm = min-max(neighbourhood_stop_density)  -> 0..1
+       raw_access   = 0.4*freq_norm + 0.6*density_norm
+       access_score = raw_access   (already 0..1: weighted sum of two 0..1 terms)
+
+     DEVIATION FROM ORIGINAL SPEC (explicit human decision, 2026-09-01): the
+     original spec was raw_access = 0.6*frequency + 0.4*stop_density then a
+     single min-max. That let frequency dominate -- the raw terms differ ~37x in
+     scale (frequency 39.5-2105.5 vs density 4.6-57.2), so density barely moved
+     the score. We now normalize EACH term to 0..1 first, then combine, and flip
+     the weights to 0.4 frequency / 0.6 density -- deliberately giving stop
+     density more relative weight than the original spec. West Humber-Clairville's
+     outlier compression is knowingly left as-is; not in scope for this change.
   5. Write data/processed/access.parquet
   6. Print summary: top/bottom 5 by access_score, zero-stop list + their scores,
      and the raw scale gap between the frequency and density terms.
@@ -47,8 +58,11 @@ STOP_FREQ = os.path.abspath(os.path.join(HERE, "..", "data", "processed", "stop_
 OUT_PARQUET = os.path.abspath(os.path.join(HERE, "..", "data", "processed", "access.parquet"))
 
 PROJECTED_CRS = 2952   # MTM zone 10, metres -- for area + density
-FREQ_WEIGHT = 0.6
-DENSITY_WEIGHT = 0.4
+# Weights on the *normalized* terms. Flipped from the original spec's 0.6/0.4
+# (freq/density) to 0.4/0.6 -- see module docstring, step 4. Explicit human
+# decision 2026-09-01.
+FREQ_WEIGHT = 0.4
+DENSITY_WEIGHT = 0.6
 RESCUE_TOL_M = 25      # snap a just-outside stop to its nearest polygon within this many metres
 
 
@@ -169,15 +183,21 @@ def main() -> int:
     acc["stop_count"] = acc["stop_count"].fillna(0).astype(int)
     acc["neighbourhood_frequency"] = acc["neighbourhood_frequency"].fillna(0.0)
     acc["neighbourhood_stop_density"] = acc["stop_count"] / acc["area_km2"]
+
+    # Normalize each term to 0..1 FIRST, then combine (revised formula 2026-09-01).
+    acc["freq_norm"] = minmax(acc["neighbourhood_frequency"])
+    acc["density_norm"] = minmax(acc["neighbourhood_stop_density"])
     acc["raw_access"] = (
-        FREQ_WEIGHT * acc["neighbourhood_frequency"]
-        + DENSITY_WEIGHT * acc["neighbourhood_stop_density"]
+        FREQ_WEIGHT * acc["freq_norm"] + DENSITY_WEIGHT * acc["density_norm"]
     )
-    acc["access_score"] = minmax(acc["raw_access"])
+    # raw_access is already in 0..1 (weighted sum of two 0..1 terms, weights sum
+    # to 1), so access_score == raw_access -- no second normalization.
+    acc["access_score"] = acc["raw_access"]
 
     acc = acc[[
         "AREA_SHORT_CODE", "AREA_NAME", "stop_count", "neighbourhood_frequency",
-        "area_km2", "neighbourhood_stop_density", "raw_access", "access_score",
+        "area_km2", "neighbourhood_stop_density", "freq_norm", "density_norm",
+        "raw_access", "access_score",
     ]].sort_values("access_score", ascending=False).reset_index(drop=True)
 
     os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
@@ -192,36 +212,60 @@ def main() -> int:
     print(f"  stops assigned to a neighbourhood: {total_assigned} "
           f"(of {len(stops)} total; {len(unmatched)} outside the boundary set)")
 
-    print("\n  raw term scale gap (before the single min-max on raw_access):")
+    print("\n  REVISED formula: raw_access = 0.4*freq_norm + 0.6*density_norm  "
+          "(each term min-max'd to 0..1 first); access_score = raw_access.")
+    print("  raw term ranges (pre-normalization -- the scale gap this revision fixes):")
     print(f"    neighbourhood_frequency      : {acc['neighbourhood_frequency'].min():.1f} "
           f".. {acc['neighbourhood_frequency'].max():.1f}  "
           f"(median {acc['neighbourhood_frequency'].median():.1f})")
     print(f"    neighbourhood_stop_density   : {acc['neighbourhood_stop_density'].min():.1f} "
           f".. {acc['neighbourhood_stop_density'].max():.1f}  "
           f"(median {acc['neighbourhood_stop_density'].median():.1f})  [stops/km^2]")
-    print(f"    -> frequency term is ~{acc['neighbourhood_frequency'].max() / acc['neighbourhood_stop_density'].max():.0f}x "
-          f"larger at the top end; 0.6/0.4 weights apply to these raw scales.")
+    print(f"    -> ~{acc['neighbourhood_frequency'].max() / acc['neighbourhood_stop_density'].max():.0f}x "
+          f"apart at the top end; now each is min-max'd to 0..1 BEFORE weighting, "
+          f"so both terms have equal reach and the 0.4/0.6 weights actually bite.")
+
+    def _row(r):
+        return (f"    {r['access_score']:.3f}  {r['AREA_NAME']:<38} "
+                f"stops={r['stop_count']:3d}  freq={r['neighbourhood_frequency']:7.1f} "
+                f"(fn={r['freq_norm']:.3f})  dens={r['neighbourhood_stop_density']:5.1f} "
+                f"(dn={r['density_norm']:.3f})")
 
     print("\n  TOP 5 access_score:")
     for _, r in acc.head(5).iterrows():
-        print(f"    {r['access_score']:.3f}  {r['AREA_NAME']:<38} "
-              f"stops={r['stop_count']:3d}  freq={r['neighbourhood_frequency']:7.1f}  "
-              f"dens={r['neighbourhood_stop_density']:5.1f}")
+        print(_row(r))
 
     print("\n  BOTTOM 5 access_score:")
     for _, r in acc.tail(5).iterrows():
-        print(f"    {r['access_score']:.3f}  {r['AREA_NAME']:<38} "
-              f"stops={r['stop_count']:3d}  freq={r['neighbourhood_frequency']:7.1f}  "
-              f"dens={r['neighbourhood_stop_density']:5.1f}")
+        print(_row(r))
+
+    whc = acc[acc["AREA_NAME"].str.startswith("West Humber")]
+    if len(whc):
+        r = whc.iloc[0]
+        rank = acc.index[acc["AREA_NAME"] == r["AREA_NAME"]][0] + 1
+        print(f"\n  West Humber-Clairville outlier check (compression left as-is, per decision):")
+        print(f"    was access_score 1.000 (rank 1) under old formula")
+        print(f"    now access_score {r['access_score']:.3f} (rank {rank} of 158)  "
+              f"freq_norm={r['freq_norm']:.3f}  density_norm={r['density_norm']:.3f}")
+        print(f"    gap to #2 now {r['access_score'] - acc['access_score'].iloc[1]:+.3f} "
+              f"(was +0.231)")
 
     zero = acc[acc["stop_count"] == 0]
-    print(f"\n  zero-stop neighbourhoods: {len(zero)}")
+    print(f"\n  zero-stop neighbourhoods: {len(zero)}  "
+          f"(rule still implemented: access stays in, not excluded -- just never triggered)")
     for _, r in zero.iterrows():
         print(f"    {r['AREA_NAME']:<38}  raw_access={r['raw_access']:.4f}  "
               f"access_score={r['access_score']:.4f}")
-    if len(zero):
-        print(f"  -> min access_score overall = {acc['access_score'].min():.4f} "
-              f"(zero-stop rows sit at the floor; kept in normalization, not excluded)")
+
+    avon = acc[acc["AREA_NAME"] == "Avondale"]
+    if len(avon):
+        r = avon.iloc[0]
+        rank = acc.index[acc["AREA_NAME"] == "Avondale"][0] + 1
+        print(f"\n  Avondale (was the 0.000 floor under old formula):")
+        print(f"    now access_score {r['access_score']:.4f} (rank {rank} of 158, "
+              f"{'still near the bottom' if rank >= 154 else 'MOVED -- investigate'})")
+    print(f"  overall access_score range: {acc['access_score'].min():.4f} "
+          f".. {acc['access_score'].max():.4f}")
 
     print("\nPhase 1b done. Next: Phase 2 demographics -> need_score (needs confirmation).")
     return 0
