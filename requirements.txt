@@ -1,0 +1,10 @@
+pandas
+numpy
+requests
+geopandas
+shapely
+partridge
+folium
+branca
+pyarrow
+openpyxl
