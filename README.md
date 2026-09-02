@@ -40,7 +40,7 @@ produce a new snapshot.
 
 ## How to view it
 
-- **Online:** [DEPLOYED_URL_HERE]
+- **Online:** https://racheljxw.github.io/who-gets-the-bus/
 - **No setup:** open [`output/index.html`](output/index.html) directly in any
   modern browser. It is a single self-contained file — the map library, fonts,
   and spreadsheet-export code are all embedded. The only thing it fetches at
