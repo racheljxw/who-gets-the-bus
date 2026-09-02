@@ -36,6 +36,7 @@ Run:
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import os
 import re
@@ -169,6 +170,22 @@ def vendor_google_font(html: str) -> str:
         b64 = base64.b64encode(raw).decode("ascii")
         css = css.replace(fm.group(1), f"data:font/woff2;base64,{b64}")
     return html.replace(m.group(0), f"<style>\n{css}\n</style>")
+
+
+SHEETJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"
+
+
+def vendor_sheetjs(html: str) -> str:
+    """Inline SheetJS (xlsx.full.min.js) as a plain <script> in <head>, so the
+    Phase 5 "Download data (.xlsx)" button works with zero runtime third-party
+    fetches (CLAUDE.md section 2), same rule as the vendored Noto Sans font. On
+    fetch failure the button is left wired but XLSX is undefined -> it alerts."""
+    body = _download(SHEETJS_URL)
+    if body is None:
+        print("  WARN SheetJS not vendored -- export button will not function")
+        return html
+    tag = f"<script>\n{body.decode('utf-8', 'replace')}\n</script>\n"
+    return html.replace("</head>", tag + "</head>", 1)
 
 
 def inline_web_assets(html: str) -> str:
@@ -314,6 +331,22 @@ SHELL_CSS = f"""
   .wgtb-zoom button:first-child {{ border-right:1px solid var(--panel-border); }}
   .wgtb-zoom button:hover {{ background:var(--active-fill); color:var(--text-active); }}
 
+  /* Export button -- no surrounding panel box; it sits directly in the side
+     column, full-width so it lines up with the Layers/Legend panels, contents
+     left-aligned like the layer rows. Interior reuses the active-row colours;
+     hover only for real pointer devices. */
+  .wgtb-export-btn {{
+    display:flex; align-items:center; justify-content:flex-start; gap:6px;
+    width:100%; padding:9px 10px; border-radius:4px;
+    font-family:inherit; font-size:13px; text-align:left; cursor:pointer;
+    background:var(--active-fill); border:1px solid var(--active-border);
+    color:var(--text-active);
+  }}
+  .wgtb-export-btn svg {{ width:13px; height:13px; flex:0 0 auto; }}
+  @media (hover:hover) and (pointer:fine) {{
+    .wgtb-export-btn:hover {{ background:#2e1c85; }}
+  }}
+
   .wgtb-footer {{ font-size:10px; color:var(--muted); line-height:1.4; }}
   .wgtb-footer a {{ color:var(--muted-2); }}
 
@@ -326,7 +359,8 @@ SHELL_CSS = f"""
     .wgtb-layers     {{ order:2; }}
     .wgtb-map-panel  {{ order:3; min-height:60vh; }}
     .wgtb-legend-panel {{ order:4; }}
-    .wgtb-footer     {{ order:5; }}
+    .wgtb-export-panel {{ order:5; }}
+    .wgtb-footer     {{ order:6; }}
 
     .wgtb-title-main {{ font-size:18px; }}
 
@@ -376,6 +410,15 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         '        <div class="wgtb-panel-h">Legend</div>'
         '        <div class="wgtb-legend-body"></div>'
         '      </div>'
+        '      <div class="wgtb-export-panel">'
+        '        <button type="button" class="wgtb-export-btn">'
+        '          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" '
+        'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="M8 2v8m0 0 2.5-2.5M8 10 5.5 7.5"/>'
+        '<path d="M2.5 10.5v2A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg>'
+        '          <span>Download data (.xlsx)</span>'
+        '        </button>'
+        '      </div>'
         '    </aside>'
         '  </div>'
         f'  <footer class="wgtb-footer">{footer_html}</footer>'
@@ -411,6 +454,69 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         "  var zo = document.querySelector('.wgtb-zoom-out');\n"
         "  if (zi) zi.addEventListener('click', function () { MAP.zoomIn(); });\n"
         "  if (zo) zo.addEventListener('click', function () { MAP.zoomOut(); });\n"
+        "\n"
+        "  // ---- spreadsheet export (Phase 5) ------------------------------------\n"
+        "  // Pulls the already-loaded feature properties straight off an in-memory\n"
+        "  // choropleth layer (LAYERS.gap carries the full property set for all 158\n"
+        "  // polygons whether or not it is the painted layer) -- no re-fetch of\n"
+        "  // equity.geojson. SheetJS (XLSX) is vendored inline in <head>.\n"
+        "  var SNAP = {\n"
+        f"    generated: {json.dumps(datetime.date.today().isoformat())},\n"
+        f"    gtfs: {json.dumps(GTFS_VALID)},\n"
+        f"    retrieved: {json.dumps(DATA_SNAPSHOT)}\n"
+        "  };\n"
+        "  var XCOLS = ['AREA_SHORT_CODE', 'AREA_NAME', 'access_score', 'need_score',\n"
+        "    'equity_gap', 'stop_count', 'total_effective_frequency', 'low_income_pct',\n"
+        "    'non_car_commute_pct', 'population_density', 'imputed_flag'];\n"
+        "  function rnd(v, n) {\n"
+        "    if (v === null || v === undefined || v === '' || isNaN(v)) return v;\n"
+        "    var f = Math.pow(10, n); return Math.round(Number(v) * f) / f;\n"
+        "  }\n"
+        "  function collectRows() {\n"
+        "    var rows = [];\n"
+        "    LAYERS.gap.eachLayer(function (l) {\n"
+        "      var p = l.feature && l.feature.properties;\n"
+        "      if (!p) return;\n"
+        "      rows.push({\n"
+        "        AREA_SHORT_CODE: Number(p.AREA_SHORT_CODE),\n"
+        "        AREA_NAME: p.AREA_NAME,\n"
+        "        access_score: rnd(p.access_score, 3),\n"
+        "        need_score: rnd(p.need_score, 3),\n"
+        "        equity_gap: rnd(p.equity_gap, 3),\n"
+        "        stop_count: Number(p.stop_count),\n"
+        "        total_effective_frequency: rnd(p.total_effective_frequency, 1),\n"
+        "        low_income_pct: rnd(p.low_income_pct, 1),\n"
+        "        non_car_commute_pct: rnd(p.non_car_commute_pct, 1),\n"
+        "        population_density: rnd(p.population_density, 1),\n"
+        "        imputed_flag: !!p.imputed_flag\n"
+        "      });\n"
+        "    });\n"
+        "    rows.sort(function (a, b) { return a.AREA_SHORT_CODE - b.AREA_SHORT_CODE; });\n"
+        "    return rows;\n"
+        "  }\n"
+        "  function downloadXlsx() {\n"
+        "    if (typeof XLSX === 'undefined') { alert('Spreadsheet library failed to load.'); return; }\n"
+        "    var rows = collectRows();\n"
+        "    var ws = XLSX.utils.json_to_sheet(rows, { header: XCOLS });\n"
+        "    ws['!cols'] = [ {wch:16},{wch:36},{wch:12},{wch:11},{wch:11},{wch:11},\n"
+        "      {wch:26},{wch:15},{wch:20},{wch:20},{wch:13} ];\n"
+        "    var about = XLSX.utils.aoa_to_sheet([\n"
+        "      ['Toronto Transit Equity Map \\u2014 neighbourhood scores'],\n"
+        "      ['Spreadsheet generated', SNAP.generated],\n"
+        "      [SNAP.gtfs],\n"
+        "      [SNAP.retrieved],\n"
+        "      ['Neighbourhoods', rows.length],\n"
+        "      ['equity_gap', 'need_score minus access_score; positive = underserved relative to need'],\n"
+        "      ['Source', 'City of Toronto Open Data, Open Government Licence \\u2013 Toronto']\n"
+        "    ]);\n"
+        "    about['!cols'] = [ {wch:24}, {wch:74} ];\n"
+        "    var wb = XLSX.utils.book_new();\n"
+        "    XLSX.utils.book_append_sheet(wb, ws, 'Neighbourhood Scores');\n"
+        "    XLSX.utils.book_append_sheet(wb, about, 'About');\n"
+        "    XLSX.writeFile(wb, 'toronto_transit_equity_scores.xlsx');\n"
+        "  }\n"
+        "  var xb = document.querySelector('.wgtb-export-btn');\n"
+        "  if (xb) xb.addEventListener('click', downloadXlsx);\n"
         "  // Pen the view to the GTA. The zoom-out floor is 'all of Toronto just fits\n"
         "  // the viewport' -- recomputed from the actual data bounds on load + resize\n"
         "  // (getBoundsZoom), so a phone floors lower than a wide desktop and neither\n"
@@ -478,6 +584,14 @@ def main() -> int:
     gdf["tt_lowinc"] = gdf["low_income_pct"].map(lambda v: _fmt(v, ".1f") + "%")
     gdf["tt_noncar"] = gdf["non_car_commute_pct"].map(lambda v: _fmt(v, ".1f") + "%")
     gdf["tt_dens"] = gdf["population_density"].map(lambda v: _fmt(v, ",.0f"))
+
+    # Phase 5 export reads raw feature properties straight off the in-memory layer
+    # and rounds them in JS. Pre-round total_effective_frequency here (the one
+    # export column with enough decimals to hit exact x.x5 half-way values, where
+    # JS Math.round and pandas/format round-half-to-even disagree) so the exported
+    # number always matches the tooltip's ",.1f" and the pipeline parquet. Nothing
+    # else consumes this column raw -- tt_freq above is already a formatted string.
+    gdf["total_effective_frequency"] = gdf["total_effective_frequency"].round(1)
 
     data_bounds = tuple(round(float(v), 4) for v in gdf.total_bounds)  # (minlon, minlat, maxlon, maxlat), EPSG:4326
 
@@ -634,8 +748,9 @@ def main() -> int:
     # 3. wiring JS after folium's trailing <script>
     html = html.replace("</html>", wiring + "</html>", 1)
 
-    # 4. vendor the Google font, then every remaining CDN asset
+    # 4. vendor the Google font + SheetJS, then every remaining CDN asset
     html = vendor_google_font(html)
+    html = vendor_sheetjs(html)
     html = inline_web_assets(html)
 
     with open(OUT_HTML, "w", encoding="utf-8") as fh:
