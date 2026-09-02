@@ -3,73 +3,61 @@ Phase 1b -- spatial join stops -> neighbourhoods, then neighbourhood access_scor
 
 Inputs:
   data/raw/neighbourhoods-4326.geojson        158 polygons, EPSG:4326
-  data/processed/stop_frequency.parquet       per-stop 7-9am trips_per_hour (Phase 1a)
+  data/processed/stop_frequency.parquet       per-stop 7-9am frequency (Phase 1a)
+Output:
+  data/processed/access.parquet               158 rows -- AREA_SHORT_CODE,
+  AREA_NAME, stop_count, subway_stop_count, rapid_transit_stop_count,
+  neighbourhood_frequency, neighbourhood_capacity_weighted_frequency,
+  nearby_rapid_transit_credit, total_effective_frequency, area_km2,
+  neighbourhood_stop_density, freq_norm, density_norm, raw_access, access_score
 
 Steps (see CLAUDE.md section 5 + risk area 3):
   1. Load polygons, reproject to EPSG:2952 (MTM zone 10, metres) for area/density.
-  2. Load stop frequency, build Point geoms from stop_lon/lat (EPSG:4326),
-     reproject to EPSG:2952.
-  3. sjoin(predicate='intersects') so boundary-line stops are not dropped.
-     A stop exactly on a shared edge can match >1 polygon -> dedup by stop_id,
-     keeping the match with the smallest AREA_SHORT_CODE (deterministic), so no
-     stop is ever counted in two neighbourhoods. Report every deduped stop.
+  2. Load stop frequency, build Point geoms from stop_lon/lat, reproject to 2952.
+  3. sjoin(predicate='intersects') so boundary-line stops are not dropped. A stop
+     on a shared edge can match >1 polygon -> dedup by stop_id keeping the
+     smallest AREA_SHORT_CODE (deterministic), so no stop is counted twice.
   4. Per neighbourhood (LEFT join from all 158 polygons; zero-stop kept):
-       stop_count,
        neighbourhood_capacity_weighted_frequency = SUM(capacity_weighted_trips_per_hour),
-       neighbourhood_frequency = SUM(trips_per_hour)   [kept for audit only],
-       nearby_rapid_transit_credit = walkshed credit from Fix B (below),
-       total_effective_frequency = neighbourhood_capacity_weighted_frequency
-                                   + nearby_rapid_transit_credit,
-       area_km2, neighbourhood_stop_density = stop_count / area_km2,
+       nearby_rapid_transit_credit               = walkshed credit (step 3b),
+       total_effective_frequency = the two above added,
+       neighbourhood_stop_density = stop_count / area_km2,
        freq_norm    = min-max(total_effective_frequency)   -> 0..1
        density_norm = min-max(neighbourhood_stop_density)  -> 0..1
-       raw_access   = 0.4*freq_norm + 0.6*density_norm
-       access_score = raw_access   (already 0..1: weighted sum of two 0..1 terms)
+       raw_access   = 0.4*freq_norm + 0.6*density_norm     (already 0..1)
+       access_score = raw_access
+     Plain neighbourhood_frequency (unweighted stop_time count) is kept for audit.
+  5. Write access.parquet, then print the summary.
 
-     CAPACITY-WEIGHTING PATCH (2026-09-01, Phase 3 review): freq_norm uses a
-     *capacity-weighted* frequency (each stop_time scaled by vehicle capacity per
-     mode -- subway x15, LRT x6, streetcar x2.5, bus x1; see
-     scripts/02_stop_frequency.py and CLAUDE.md section 5). Before this, sparse
-     rapid-transit neighbourhoods (North Toronto, Yonge-Doris) scored as
-     "underserved" purely because a station is one physical stop while a bus
-     corridor is many. Plain neighbourhood_frequency is still written for audit.
+Why normalize each term BEFORE combining, and why 0.4/0.6 (deviation from the
+kickoff spec -- explicit human decision, see CLAUDE.md section 5):
+  The kickoff spec was raw_access = 0.6*frequency + 0.4*stop_density then a
+  single min-max on the sum. The two raw terms differ ~37x in scale, so one
+  combined min-max let frequency dominate and stop density barely moved the
+  score. Fix: min-max EACH term to 0..1 first, then combine, and flip the
+  weights to 0.4 frequency / 0.6 density -- deliberately giving stop density
+  the larger share.
 
-     PATCH 2 / FIX B (2026-09-01) -- rapid-transit walkshed credit. The
-     point-in-polygon assignment in step 3 is unchanged and stays primary, but a
-     station 20 m outside a boundary (Eglinton Station vs North Toronto) still
-     serves that neighbourhood in reality. So, ADDITIONALLY, credit nearby
-     rapid-transit service with linear distance decay over CREDIT_RADIUS_M (500
-     m). One station can credit several nearby neighbourhoods -- intentional, it
-     mirrors walkable access; it is NOT a join fix and does not move the stop's
-     primary assignment. Every credit is printed with station + distance.
+Why the frequency term is capacity-weighted:
+  freq_norm is built from a capacity-weighted frequency (each stop_time scaled by
+  vehicle capacity per mode in 02_stop_frequency.py). Without it, a neighbourhood
+  with one subway station scored below a bus corridor with many closely-spaced
+  stops, because the density term already rewards tight stop spacing.
 
-     PATCH 3 (2026-09-01) -- dedupe platforms into physical STATIONS before
-     applying decay. GTFS lists each platform as its own stop, so patch 2
-     credited a 4-platform interchange four times for one physical walk. Now:
-     group rapid-transit platforms by GTFS parent_station (checked first; this
-     feed has none populated) else by normalized stop_name (suffix stripped;
-     grouping printed for audit). Per station: total_station_frequency = SUM of
-     platform capacity_weighted_trips_per_hour; location = centroid of platform
-     coords (EPSG:2952). Then for every polygon P not containing a station S's
-     centroid, if dist(S, P) <= 500 m:
-        credit(P) += total_station_frequency(S) * (1 - dist / 500)
-     nearby_rapid_transit_credit = SUM of those; total_effective_frequency =
-     neighbourhood_capacity_weighted_frequency (own stops) + that credit;
-     freq_norm = min-max(total_effective_frequency).
-
-     DEVIATION FROM ORIGINAL SPEC (explicit human decision, 2026-09-01): the
-     original spec was raw_access = 0.6*frequency + 0.4*stop_density then a
-     single min-max. That let frequency dominate -- the raw terms differ ~37x in
-     scale (frequency 39.5-2105.5 vs density 4.6-57.2), so density barely moved
-     the score. We now normalize EACH term to 0..1 first, then combine, and flip
-     the weights to 0.4 frequency / 0.6 density -- deliberately giving stop
-     density more relative weight than the original spec. West Humber-Clairville's
-     outlier compression is knowingly left as-is; not in scope for this change.
-  5. Write data/processed/access.parquet
-  6. Print summary: top/bottom 5 by access_score, zero-stop list + their scores,
-     and the raw scale gap between the frequency and density terms.
-
-Phase 2 (demographics -> need_score) is next and needs explicit confirmation.
+Why a rapid-transit walkshed credit, deduped to stations (step 3b):
+  Point-in-polygon assignment (step 3) stays primary, but a busy station just
+  outside a boundary still serves the neighbourhood in reality (e.g. Eglinton
+  Station sits ~20 m outside North Toronto). So every polygon additionally gets
+  nearby_rapid_transit_credit from rapid-transit STATIONS within CREDIT_RADIUS_M
+  of its edge, with linear decay (full credit at the boundary, zero at the
+  radius). Platforms are grouped into physical stations first (GTFS
+  parent_station if populated, else normalized stop_name) so a multi-platform
+  interchange is one distance-decayed contribution, not one per platform. The
+  500 m radius and linear (not exponential) decay are deliberate round-number
+  assumptions: 500 m ~ a 6-minute walk, the standard transit catchment; linear
+  is the simplest defensible shape and needs no second tuning parameter. One
+  station credits every polygon in range -- intentional (walkable access), not a
+  join fix; it never moves a stop's primary assignment.
 
 Usage:
     python scripts/03_access_score.py
@@ -95,13 +83,12 @@ STOP_FREQ = os.path.abspath(os.path.join(HERE, "..", "data", "processed", "stop_
 OUT_PARQUET = os.path.abspath(os.path.join(HERE, "..", "data", "processed", "access.parquet"))
 
 PROJECTED_CRS = 2952   # MTM zone 10, metres -- for area + density
-# Weights on the *normalized* terms. Flipped from the original spec's 0.6/0.4
-# (freq/density) to 0.4/0.6 -- see module docstring, step 4. Explicit human
-# decision 2026-09-01.
+# Weights on the *normalized* terms -- 0.4 frequency / 0.6 density (see the
+# module docstring for why the density term gets the larger share).
 FREQ_WEIGHT = 0.4
 DENSITY_WEIGHT = 0.6
-RESCUE_TOL_M = 25       # snap a just-outside stop to its nearest polygon within this many metres
-CREDIT_RADIUS_M = 500.0  # Fix B: rapid-transit walkshed radius, linear decay to 0 at the edge
+RESCUE_TOL_M = 25        # snap a just-outside stop to its nearest polygon within this many metres
+CREDIT_RADIUS_M = 500.0  # rapid-transit walkshed radius; linear decay to 0 at the edge
 
 
 def minmax(s: pd.Series) -> pd.Series:
@@ -111,9 +98,9 @@ def minmax(s: pd.Series) -> pd.Series:
     return (s - lo) / (hi - lo)
 
 
-# Fix B / patch 3: collapse platform stop_names to a physical-station name by
-# stripping the direction / platform suffix. Handles the shapes actually seen in
-# this feed (audited in 03's output):
+# Collapse platform stop_names to a physical-station name by stripping the
+# direction / platform suffix. Handles the shapes actually seen in this feed
+# (the full station->platforms grouping is printed at run time for audit):
 #   "X Station - Northbound Platform"                 (subway, dashed)
 #   "X Station - Northbound Platform Towards Finch"   (Union, trailing text)
 #   "X Station - Subway Platform"                     (interchange subway side)
@@ -233,13 +220,14 @@ def main() -> int:
     print(f"\n  {len(matched)} stop->neighbourhood assignments after dedup "
           f"(1 neighbourhood per stop)")
 
-    # ---- 3b. FIX B (patch 3): STATION-level rapid-transit walkshed credit ----
-    # Does NOT touch step 3's point-in-polygon assignment. Patch 3 change: dedupe
-    # platforms into physical stations FIRST, so a 4-platform interchange is one
-    # distance-decayed contribution, not four. Then for each station S and each
-    # polygon P whose interior does not contain S's centroid, if the centroid is
-    # <= CREDIT_RADIUS_M from P: credit(P) += total_station_frequency(S) *
-    # (1 - dist/CREDIT_RADIUS_M). Distances in EPSG:2952 metres.
+    # ---- 3b. station-level rapid-transit walkshed credit ----
+    # Does NOT touch step 3's point-in-polygon assignment. Dedupe platforms into
+    # physical stations FIRST, so a 4-platform interchange is one distance-decayed
+    # contribution, not four. Then for each station S and each polygon P whose
+    # interior does not contain S's centroid, if the centroid is <=
+    # CREDIT_RADIUS_M from P:
+    #   credit(P) += total_station_frequency(S) * (1 - dist/CREDIT_RADIUS_M)
+    # Distances in EPSG:2952 metres.
     rt = stops.loc[
         stops["has_rapid_transit"] & (stops["capacity_weighted_trips_per_hour"] > 0),
         ["stop_id", "stop_name", "parent_station",
@@ -247,7 +235,7 @@ def main() -> int:
     ].copy()
 
     n_parent = int(rt["parent_station"].notna().sum())
-    print(f"\n  Fix B (station-level walkshed, {CREDIT_RADIUS_M:.0f} m linear decay):")
+    print(f"\n  station-level walkshed credit ({CREDIT_RADIUS_M:.0f} m linear decay):")
     print(f"    {len(rt)} rapid-transit platforms with service; "
           f"GTFS parent_station populated on {n_parent} / {len(rt)}")
     if n_parent == len(rt):
@@ -346,10 +334,10 @@ def main() -> int:
     )
     acc["neighbourhood_stop_density"] = acc["stop_count"] / acc["area_km2"]
 
-    # Normalize each term to 0..1 FIRST, then combine (revised formula 2026-09-01).
-    # freq_norm uses total_effective_frequency: own capacity-weighted stops (Fix A
-    # weights) + the Fix B walkshed credit. Plain neighbourhood_frequency and the
-    # own-stops-only capacity-weighted frequency are kept for audit.
+    # Normalize each term to 0..1 FIRST, then combine (see module docstring).
+    # freq_norm uses total_effective_frequency = own capacity-weighted frequency
+    # + walkshed credit. Plain neighbourhood_frequency and the own-stops-only
+    # capacity-weighted frequency are kept for audit.
     acc["freq_norm"] = minmax(acc["total_effective_frequency"])
     acc["density_norm"] = minmax(acc["neighbourhood_stop_density"])
     acc["raw_access"] = (
@@ -370,7 +358,7 @@ def main() -> int:
     os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
     acc.to_parquet(OUT_PARQUET, index=False)
 
-    # ---- 5/6. report ----
+    # ---- 5. report ----
     print("\n" + "-" * 78)
     print(f"  wrote {OUT_PARQUET}  ({len(acc)} rows)")
     assert len(acc) == 158, f"expected 158 neighbourhoods, got {len(acc)}"
@@ -379,13 +367,10 @@ def main() -> int:
     print(f"  stops assigned to a neighbourhood: {total_assigned} "
           f"(of {len(stops)} total; {len(unmatched)} outside the boundary set)")
 
-    print("\n  formula: raw_access = 0.4*freq_norm + 0.6*density_norm  "
-          "(each term min-max'd to 0..1 first); access_score = raw_access.")
-    print("  freq_norm = minmax(total_effective_frequency), where")
-    print("    total_effective_frequency = neighbourhood_capacity_weighted_frequency "
-          "(own stops, Fix A weights: subway x15 / LRT x6 / streetcar x2.5 / bus x1)")
-    print(f"                              + nearby_rapid_transit_credit "
-          f"(Fix B: <= {CREDIT_RADIUS_M:.0f} m walkshed, linear decay)")
+    print("\n  raw_access = 0.4*freq_norm + 0.6*density_norm (each term min-max'd "
+          "0..1 first); access_score = raw_access.")
+    print("  freq_norm = minmax(total_effective_frequency)"
+          " = own capacity-weighted frequency + walkshed credit.")
     print("  raw term ranges (pre-normalization):")
     print(f"    neighbourhood_frequency (plain, audit)     : "
           f"{acc['neighbourhood_frequency'].min():.1f} "
@@ -401,12 +386,12 @@ def main() -> int:
           f".. {acc['neighbourhood_stop_density'].max():.1f}  "
           f"(median {acc['neighbourhood_stop_density'].median():.1f})  [stops/km^2]")
 
-    # ---- Fix B audit trail: every neighbourhood with credit > 0 ----
+    # ---- walkshed credit audit: every neighbourhood with credit > 0 ----
     got = acc[acc["nearby_rapid_transit_credit"] > 0].sort_values(
         "nearby_rapid_transit_credit", ascending=False
     )
-    print(f"\n  FIX B AUDIT -- {len(got)} neighbourhoods receive walkshed credit "
-          f"(why a no-own-stop score can still move); crediting STATIONS not platforms:")
+    print(f"\n  WALKSHED CREDIT AUDIT -- {len(got)} neighbourhoods receive credit "
+          f"(this is why a neighbourhood with no own rapid-transit stop can still move):")
     for _, r in got.iterrows():
         code = r["AREA_SHORT_CODE"]
         rows = cred[cred["AREA_SHORT_CODE"] == code].sort_values("credit", ascending=False)
@@ -434,7 +419,6 @@ def main() -> int:
     for _, r in acc.tail(5).iterrows():
         print(_row(r))
 
-    n_subway_nbhd = int((acc["subway_stop_count"] > 0).sum())
     n_rt_own = int((acc["rapid_transit_stop_count"] > 0).sum())
     n_rt_eff = int(((acc["rapid_transit_stop_count"] > 0)
                     | (acc["nearby_rapid_transit_credit"] > 0)).sum())
@@ -442,21 +426,10 @@ def main() -> int:
     print(f"  neighbourhoods with rapid-transit access (own stop OR walkshed credit): "
           f"{n_rt_eff} of 158")
 
-    print("\n  patch-3 (station-level walkshed) on the previously-flagged neighbourhoods:")
-    for nm in ("North Toronto", "Yonge-Doris", "Church-Wellesley",
-               "North St.James Town", "West Humber-Clairville"):
-        m = acc[acc["AREA_NAME"] == nm]
-        if len(m):
-            r = m.iloc[0]
-            rank = acc.index[acc["AREA_NAME"] == nm][0] + 1
-            print(f"    {nm:<24} access_score={r['access_score']:.3f} (rank {rank}/158)  "
-                  f"own_cwfreq={r['neighbourhood_capacity_weighted_frequency']:7.1f}  "
-                  f"+credit={r['nearby_rapid_transit_credit']:6.1f}  "
-                  f"fn={r['freq_norm']:.3f}")
-
     zero = acc[acc["stop_count"] == 0]
     print(f"\n  zero-stop neighbourhoods: {len(zero)}  "
-          f"(rule still implemented: access stays in, not excluded -- just never triggered)")
+          f"(rule implemented -- access stays in, not excluded -- but never triggered "
+          f"in this data)")
     for _, r in zero.iterrows():
         print(f"    {r['AREA_NAME']:<38}  raw_access={r['raw_access']:.4f}  "
               f"access_score={r['access_score']:.4f}")

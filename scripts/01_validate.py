@@ -1,5 +1,11 @@
 """
-Phase 0 -- Step 4: inspect + validate the raw downloads before any processing.
+Phase 0 (setup & validation) -- inspect and validate the raw downloads before
+any processing.
+
+Inputs:  data/raw/*.zip (GTFS), data/raw/*.geojson (boundaries),
+         data/raw/*.xlsx (profiles).
+Outputs: console reports only -- no files written. It fails loudly if the join
+         key or GTFS calendar assumptions the pipeline relies on no longer hold.
 
 NO heavy processing happens here -- stop_times.txt is deliberately left untouched
 (that is Phase 1). This script only:
@@ -93,7 +99,9 @@ def inspect_gtfs() -> None:
         print(f"  {len(members)} members:")
         for m in sorted(members):
             info = zf.getinfo(m)
-            flag = "   <-- ~4.26M rows / ~400MB: DO NOT load in full (Phase 1 filters it)" \
+            # stop_times.txt is ~200 MB uncompressed -- too big to load casually;
+            # Phase 1 reads only a service_id=1 + 7-9am slice of it via partridge.
+            flag = "   <-- Phase 1 filters this, never loads it whole" \
                 if m == "stop_times.txt" else ""
             print(f"    {m:22s} {info.file_size/1e6:9.2f} MB uncompressed{flag}")
 

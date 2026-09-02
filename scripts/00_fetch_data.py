@@ -1,5 +1,12 @@
 """
-Phase 0 -- Step 3: discover + fetch the three source datasets.
+Phase 0 (setup & validation) -- discover and fetch the three source datasets.
+
+Inputs:  the City of Toronto CKAN API (`package_show`) for the three package ids
+         in PACKAGES; nothing on disk.
+Outputs: data/raw/opendata_ttc_schedules.zip                   (TTC GTFS feed)
+         data/raw/neighbourhoods-4326.geojson                  (158 polygons)
+         data/raw/nbhd_2021_census_profile_full_158model.xlsx  (2021 profiles)
+         -- only with --download; a bare run just prints what it found.
 
 What this does:
   1. Calls the CKAN `package_show` action for each of the three packages named

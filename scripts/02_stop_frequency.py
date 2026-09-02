@@ -1,60 +1,47 @@
 """
 Phase 1a -- GTFS -> per-stop weekday morning trip frequency.
 
+Inputs:  data/raw/opendata_ttc_schedules.zip   (TTC GTFS feed)
+Outputs: data/processed/stop_frequency.parquet
+         one row per stop in stops.txt -- stop_id, stop_name, parent_station,
+         stop_lat, stop_lon, trip_count, trips_per_hour,
+         capacity_weighted_trip_count, capacity_weighted_trips_per_hour,
+         subway_trip_count, has_subway_route, rapid_transit_trip_count,
+         has_rapid_transit. Zero-service stops are kept with 0s.
+
 Pipeline:
-  1. Pick a representative *normal weekday* date inside the feed's valid range
-     (2026-09-06 .. 2026-10-31), skipping 2026-09-07 (Labour Day: calendar_dates
-     removes service_id 1 that day). We confirm via partridge that service_id 1
-     is actually active on the chosen date.
+  1. Pick a representative *normal weekday* date inside the feed's valid range,
+     skipping Labour Day (calendar_dates removes service_id 1 that day). The
+     actual filter is on service_id, not the date; the date only justifies the
+     choice and is confirmed active via partridge.
   2. Load the feed through partridge with a view that keeps ONLY service_id == 1
      trips. Partridge propagates that filter to stop_times automatically.
   3. Filter stop_times to rows whose arrival_time OR departure_time falls in the
      07:00:00-09:00:00 window. GTFS clock strings can exceed 24:00:00 for
-     after-midnight trips, so we parse "HH:MM:SS" as *seconds since midnight*
-     (h may be >= 24), never as wall-clock, then compare in seconds.
-  4. trips_per_hour(stop) = (qualifying stop_times at that stop) / 2   [2-hour window]
-     lat/lon joined from stops.txt.
-  4b. CAPACITY WEIGHTING (2026-09-01 decision -- see CLAUDE.md section 5).
-     Plain trip counts treat a 6-car subway train and a single bus as equal.
-     They aren't: a subway station serves far more passenger capacity per
-     vehicle, so sparse-but-high-capacity subway neighbourhoods (North Toronto,
-     Yonge-Doris) were scoring as "underserved" purely because they have few
-     physical stops. Fix: weight each qualifying stop_time by its route's
-     vehicle capacity, via GTFS route_type + route_long_name.
+     after-midnight trips, so times are compared as *seconds since midnight*
+     (h may be >= 24), never as wall-clock.
+  4. trips_per_hour(stop) = (qualifying stop_times at that stop) / 2, lat/lon
+     joined from stops.txt.
+  5. Write the parquet.
 
-     PATCH 2 / FIX A (2026-09-01) -- split route_type=0 into legacy streetcar
-     vs modern LRT. This feed codes BOTH the legacy streetcar network (Queen,
-     King, Spadina, ...) AND the new Flexity-Freedom light-rail lines
-     ("Line 5 Eglinton", "Line 6 Finch West") as route_type=0. They are very
-     different vehicles, so we classify per route:
+Why capacity weighting (deviation from a plain trip count -- see CLAUDE.md §5):
+  A plain stop_time count treats a 6-car subway train and a single bus as equal.
+  Combined with the stop-density term in 03_access_score.py (which favours
+  closely-spaced bus stops), that made rapid-transit neighbourhoods score as
+  "underserved" purely for having few physical stops. So each qualifying
+  stop_time is scaled by its route's approximate vehicle capacity, normalized to
+  a standard bus = 1.0 (see CAPACITY_MULTIPLIER). Each stop_time is weighted by
+  its OWN mode before summing; a multi-mode stop is not averaged.
 
-       mode      multiplier  basis (normalized to standard bus = 1.0)
-       bus        1.0    ~50-passenger standard TTC bus -- the baseline
-       streetcar  2.5    ~130-passenger single low-floor Flexity Outlook streetcar
-       lrt        6.0    Flexity Freedom LRVs run COUPLED, ~295-300 passengers per
-                         typical Line 5 / Line 6 train -- intermediate between a
-                         single streetcar and a subway train, equal to neither
-       subway     15.0   ~800-900-passenger 6-car T1 / Toronto Rocket trainset
-
-     "lrt" = route_type==0 AND route_long_name begins "Line <digit>" (confirmed
-     by printing every route_type=0 route in this feed first, not hard-coded).
-     All other route_type==0 -> "streetcar". Unknown route_type -> warning + 1.0.
-     Each stop_time is weighted individually by its own mode before summing -- a
-     stop served by multiple modes is NOT averaged.
-
-       capacity_weighted_trips_per_hour(stop) =
-         SUM(multiplier[mode of that stop_time]) / 2
-
-     A stop is flagged has_rapid_transit if any qualifying stop_time is subway
-     OR lrt -- this drives Fix B's 500 m walkshed credit in 03_access_score.py.
-
-  5. Write data/processed/stop_frequency.parquet
-     columns: stop_id, stop_name, parent_station, stop_lat, stop_lon, trip_count,
-              trips_per_hour, capacity_weighted_trip_count,
-              capacity_weighted_trips_per_hour, subway_trip_count,
-              has_subway_route, rapid_transit_trip_count, has_rapid_transit
-
-Phase 1b (spatial join stops -> neighbourhoods) is deliberately NOT done here.
+Why route_type==0 is split into streetcar vs lrt:
+  This feed codes BOTH the legacy streetcar network (Queen, King, Spadina, ...)
+  AND the modern Flexity-Freedom light-rail lines ("Line 5 Eglinton",
+  "Line 6 Finch West") as route_type==0, but they are very different vehicles.
+  A route is "lrt" iff route_long_name begins "Line <digit>" (matched
+  generically, and every route_type==0 route is printed for audit before the
+  rule is applied -- nothing is hard-coded by id); all other route_type==0 is
+  "streetcar". has_rapid_transit (subway OR lrt) drives the walkshed credit in
+  03_access_score.py.
 
 Usage:
     python scripts/02_stop_frequency.py
@@ -68,7 +55,6 @@ import sys
 import zipfile
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 import partridge as ptg
 
@@ -89,11 +75,12 @@ PEAK_END_SEC = 9 * 3600           # 09:00:00 -> 32400
 WINDOW_HOURS = 2.0
 
 # Approximate per-vehicle service capacity by mode, normalized to a standard
-# bus = 1.0. Sourced-but-not-precise (2026-09-01 decisions, CLAUDE.md section 5):
+# bus = 1.0. These are order-of-magnitude service-capacity ratios (nominal
+# in-service loads), NOT crush loads or measured ridership -- see CLAUDE.md §5:
 #   bus       ~50 passengers  -- standard TTC bus, the baseline
 #   streetcar ~130            -- one low-floor Flexity Outlook streetcar
-#   lrt       ~295-300        -- Line 5/6 Flexity Freedom LRVs run COUPLED (Fix A,
-#                               patch 2); intermediate between streetcar & subway
+#   lrt       ~295-300        -- Line 5/6 Flexity Freedom LRVs run COUPLED;
+#                               intermediate between a streetcar and a subway
 #   subway    ~800-900        -- 6-car T1 / Toronto Rocket trainset
 # Unknown mode ("other") warns + falls back to 1.0 (see CAPACITY_FALLBACK).
 CAPACITY_MULTIPLIER = {
@@ -103,7 +90,7 @@ CAPACITY_MULTIPLIER = {
     "subway": 15.0,
 }
 CAPACITY_FALLBACK = 1.0
-RAPID_TRANSIT_MODES = {"subway", "lrt"}   # feeds Fix B's walkshed credit
+RAPID_TRANSIT_MODES = {"subway", "lrt"}   # feeds the walkshed credit in 03
 # route_type=0 route is modern LRT (not a legacy streetcar) iff its long name
 # looks like "Line 5 Eglinton" / "Line 6 Finch West". Confirmed by printing every
 # route_type=0 route in the feed before this is applied -- see main().
@@ -216,11 +203,11 @@ def main() -> int:
         route_type=route_type
     )
 
-    # FIX A step 1: print EVERY route_type=0 route so the streetcar/LRT split is
-    # confirmed from the feed, not guessed.
+    # Print EVERY route_type=0 route so the streetcar/LRT split is confirmed from
+    # the feed, not guessed.
     rt0 = routes_slim[routes_slim["route_type"] == 0]
     print(f"\n  route_type=0 routes in this feed ({len(rt0)}): "
-          f"legacy streetcar vs modern LRT (Fix A) --")
+          f"legacy streetcar vs modern LRT --")
     for _, r in rt0.sort_values("route_id").iterrows():
         mode = classify_mode(0, r["route_long_name"])
         print(f"    route_id {str(r['route_id']):<5} short={str(r['route_short_name']):<6} "
@@ -276,9 +263,9 @@ def main() -> int:
         counts["capacity_weighted_trip_count"] / WINDOW_HOURS
     )
 
-    # every stop in stops.txt, so zero-service stops are retained as 0.
-    # stop_name + parent_station carried through for downstream audit trails
-    # (Fix B walkshed platform->station dedup).
+    # Left join from every stop in stops.txt, so zero-service stops are retained
+    # as 0. stop_name + parent_station are carried through for the platform ->
+    # station dedup that 03_access_score.py does for the walkshed credit.
     stop_cols = ["stop_id", "stop_lat", "stop_lon"]
     for extra in ("stop_name", "parent_station"):
         if extra in stops.columns:
@@ -334,11 +321,9 @@ def main() -> int:
 
     # sanity: named landmark stops (substring match on stop_name)
     print("\n  sanity -- known frequent Toronto locations (matching stops):")
-    named = stops.copy()
-    named["arr"] = np.nan
     lookup = out.set_index("stop_id")[["trip_count", "trips_per_hour"]]
     for needle in ("Bloor", "Yonge", "Dufferin", "Finch", "Union"):
-        hits = named[named["stop_name"].str.contains(needle, case=False, na=False)]
+        hits = stops[stops["stop_name"].str.contains(needle, case=False, na=False)]
         if hits.empty:
             print(f"    '{needle}': no stop_name match")
             continue

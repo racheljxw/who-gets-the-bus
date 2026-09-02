@@ -2,26 +2,29 @@
 Phase 3 -- merge access_score + need_score -> equity_gap (the headline layer).
 
 Inputs:
-  data/processed/access.parquet   (Phase 1b, 158 rows)
-  data/processed/need.parquet     (Phase 2, 158 rows)
+  data/processed/access.parquet          (Phase 1b, 158 rows)
+  data/processed/need.parquet            (Phase 2, 158 rows)
   data/raw/neighbourhoods-4326.geojson   (158 polygons, EPSG:4326 -- geometry only)
+Outputs:
+  data/processed/equity.parquet    flat table, no geometry (for CSV/XLSX export)
+  data/processed/equity.geojson    same columns + geometry (for the Phase 4 map)
+  both 158 rows, columns: AREA_SHORT_CODE, AREA_NAME, access_score, need_score,
+  equity_gap, stop_count, neighbourhood_frequency, neighbourhood_stop_density,
+  low_income_pct, non_car_commute_pct, population_density, imputed_flag
 
 Steps (CLAUDE.md section 5):
   1. Merge access + need on AREA_SHORT_CODE (inner). Both carry all 158
-     neighbourhoods; assert the merged row count is EXACTLY 158 and fail loudly
+     neighbourhoods; the merge asserts exactly 158 rows and fails loudly
      otherwise -- anything else means a join-key mismatch we have not seen.
-  2. equity_gap = need_score - access_score   (range ~ -1 .. +1). Print min/max.
+  2. equity_gap = need_score - access_score   (range ~ -1 .. +1).
   3. Merge the scored columns onto the raw neighbourhood polygons (keyed by
      AREA_SHORT_CODE) so one GeoDataFrame carries geometry + all scores + the
      raw tooltip inputs from both sides.
-  4. Write:
-       data/processed/equity.parquet    flat table, no geometry (CSV/XLSX export)
-       data/processed/equity.geojson    same columns + geometry (Phase 4 map)
+  4. Write both outputs.
   5. Report: 10 highest equity_gap (most underserved) + 10 lowest (most
      over-served relative to need), and the "well-matched" neighbourhoods where
-     BOTH scores sit within 0.05 of their respective extremes (high need + high
-     access, or low need + low access) -- interesting cases that never surface at
-     the ends of the gap ranking.
+     BOTH scores sit within MATCH_TOL of their respective extremes -- cases that
+     never surface at the ends of the gap ranking.
 
 NOTE: both source parquets have a column literally named "density_norm" but they
 mean different things (access = stop density, need = population density). Neither
@@ -60,36 +63,6 @@ OUT_COLS = [
 
 MATCH_TOL = 0.05  # "within 0.05 of the extreme" for the well-matched flag
 
-# access_score / equity_gap after PATCH 1 (capacity weighting only: subway x15,
-# streetcar x2.5, bus x1; freq_norm = minmax(own capacity-weighted frequency)),
-# for the neighbourhoods flagged in the North Toronto investigation. Captured
-# 2026-09-01 from data/processed/equity.parquet just before PATCH 2 (Fix A: split
-# streetcar/LRT + add LRT x6; Fix B: 500 m rapid-transit walkshed credit) re-ran
-# the pipeline. Kept inline so the patch-1 -> patch-2 diff is self-contained.
-FLAGGED_PATCH1 = {
-    "North Toronto":       {"access": 0.260794, "gap": 0.464267},
-    "Yonge-Doris":         {"access": 0.283600, "gap": 0.439400},
-    "Church-Wellesley":    {"access": 0.438200, "gap": 0.420800},
-    "North St.James Town": {"access": 0.404100, "gap": 0.463300},
-}
-
-# access_score / equity_gap after PATCH 2 (per-PLATFORM walkshed credit), captured
-# 2026-09-01 from data/processed/equity.parquet just before PATCH 3 (dedupe
-# platforms -> physical stations, then decay once per station). Patch 3 is a
-# granularity correction; magnitudes are expected to stay close.
-FLAGGED_PATCH2 = {
-    "North Toronto":       {"access": 0.2953, "gap": 0.4297},
-    "Yonge-Doris":         {"access": 0.3387, "gap": 0.3843},
-    "Church-Wellesley":    {"access": 0.4790, "gap": 0.3799},
-    "North St.James Town": {"access": 0.4104, "gap": 0.4570},
-}
-# per-PLATFORM walkshed credit + access under patch 2, for the two neighbourhoods
-# whose downtown platform pile-up motivated patch 3.
-PATCH2_PLATFORM = {
-    "University":     {"credit": 4320.2, "access": 0.5005},
-    "Bay-Cloverhill": {"credit": 3649.5, "access": 0.6631},
-}
-
 
 def main() -> int:
     for p in (ACCESS_PARQUET, NEED_PARQUET, GEOJSON):
@@ -104,10 +77,7 @@ def main() -> int:
     # ---- 1. merge access + need on AREA_SHORT_CODE ----
     access = pd.read_parquet(ACCESS_PARQUET)[[
         "AREA_SHORT_CODE", "AREA_NAME", "access_score", "stop_count",
-        "subway_stop_count", "rapid_transit_stop_count",
-        "neighbourhood_frequency", "neighbourhood_capacity_weighted_frequency",
-        "nearby_rapid_transit_credit", "total_effective_frequency",
-        "neighbourhood_stop_density",
+        "neighbourhood_frequency", "neighbourhood_stop_density",
     ]].copy()
     need = pd.read_parquet(NEED_PARQUET)[[
         "AREA_SHORT_CODE", "AREA_NAME", "need_score", "low_income_pct",
@@ -171,47 +141,6 @@ def main() -> int:
     def _row(r):
         return (f"    gap={r['equity_gap']:+.3f}  {r['AREA_NAME']:<38} "
                 f"need={r['need_score']:.3f}  access={r['access_score']:.3f}")
-
-    # ---- 5a. PATCH 3 (station-level walkshed): patch 2 vs patch 3 ----
-    n_rt_eff = int(((merged["rapid_transit_stop_count"] > 0)
-                    | (merged["nearby_rapid_transit_credit"] > 0)).sum())
-    print("\n" + "-" * 78)
-    print("  PATCH 3 -- dedupe rapid-transit PLATFORMS -> physical STATIONS before")
-    print("  the 500 m walkshed decay (one interchange = one distance-decayed credit).")
-    print("\n  patch 2 (per-platform) vs patch 3 (per-station), flagged neighbourhoods:")
-    for nm, p2 in FLAGGED_PATCH2.items():
-        r = merged[merged["AREA_NAME"] == nm].iloc[0]
-        da = r["access_score"] - p2["access"]
-        dg = r["equity_gap"] - p2["gap"]
-        print(f"    {nm:<22} access {p2['access']:.3f} -> {r['access_score']:.3f} ({da:+.3f})"
-              f"   equity_gap {p2['gap']:+.3f} -> {r['equity_gap']:+.3f} ({dg:+.3f})")
-        print(f"      {'':<20}   own cap-wt freq {r['neighbourhood_capacity_weighted_frequency']:7.1f}"
-              f"  + station walkshed credit {r['nearby_rapid_transit_credit']:7.1f}"
-              f"  = total_effective {r['total_effective_frequency']:7.1f}")
-
-    print("\n  the two downtown neighbourhoods that motivated patch 3"
-          " (per-platform -> per-station):")
-    for nm, pp in PATCH2_PLATFORM.items():
-        r = merged[merged["AREA_NAME"] == nm].iloc[0]
-        print(f"    {nm:<16} walkshed credit {pp['credit']:7.1f} -> {r['nearby_rapid_transit_credit']:7.1f}"
-              f"   access {pp['access']:.3f} -> {r['access_score']:.3f}")
-
-    print(f"\n  neighbourhoods with rapid-transit access (own stop OR walkshed credit): "
-          f"{n_rt_eff} of 158")
-
-    print("\n  NORTH TORONTO -- full trajectory:")
-    nt = merged[merged["AREA_NAME"] == "North Toronto"].iloc[0]
-    p0 = {"access": 0.264181, "gap": 0.460880}   # Phase 3 original (plain frequency)
-    p1 = FLAGGED_PATCH1["North Toronto"]
-    p2 = FLAGGED_PATCH2["North Toronto"]
-    print(f"    Phase 3 original : access {p0['access']:.3f}   equity_gap {p0['gap']:+.3f}   (plain frequency)")
-    print(f"    after patch 1    : access {p1['access']:.3f}   equity_gap {p1['gap']:+.3f}   "
-          f"(capacity weighting; 0 own subway stops -> barely moved)")
-    print(f"    after patch 2    : access {p2['access']:.3f}   equity_gap {p2['gap']:+.3f}   "
-          f"(Fix A LRT x6 on its Line 5 platforms; Fix B per-platform walkshed)")
-    print(f"    after patch 3    : access {nt['access_score']:.3f}   equity_gap {nt['equity_gap']:+.3f}   "
-          f"(Eglinton Stn's 4 platforms -> 1 station point; credit "
-          f"{nt['nearby_rapid_transit_credit']:.0f}, ~same total, decayed once)")
 
     print("\n" + "-" * 78)
     print("  TOP 10 equity_gap -- most UNDERSERVED (high need, low access):")
