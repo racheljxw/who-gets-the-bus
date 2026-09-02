@@ -60,6 +60,17 @@ OUT_COLS = [
 
 MATCH_TOL = 0.05  # "within 0.05 of the extreme" for the well-matched flag
 
+# OLD (pre capacity-weighting patch) access_score / equity_gap for the four
+# neighbourhoods flagged as face-validity false-positives in the Phase 3 review.
+# Captured 2026-09-01 from data/processed/equity.parquet before the patch re-ran
+# the pipeline. Kept here so the before/after print is self-contained.
+FLAGGED_OLD = {
+    "North Toronto":       {"access": 0.264181, "gap": 0.460880},
+    "Yonge-Doris":         {"access": 0.244583, "gap": 0.478441},
+    "Church-Wellesley":    {"access": 0.359737, "gap": 0.499239},
+    "North St.James Town": {"access": 0.374744, "gap": 0.492656},
+}
+
 
 def main() -> int:
     for p in (ACCESS_PARQUET, NEED_PARQUET, GEOJSON):
@@ -74,7 +85,7 @@ def main() -> int:
     # ---- 1. merge access + need on AREA_SHORT_CODE ----
     access = pd.read_parquet(ACCESS_PARQUET)[[
         "AREA_SHORT_CODE", "AREA_NAME", "access_score", "stop_count",
-        "neighbourhood_frequency", "neighbourhood_stop_density",
+        "subway_stop_count", "neighbourhood_frequency", "neighbourhood_stop_density",
     ]].copy()
     need = pd.read_parquet(NEED_PARQUET)[[
         "AREA_SHORT_CODE", "AREA_NAME", "need_score", "low_income_pct",
@@ -138,6 +149,21 @@ def main() -> int:
     def _row(r):
         return (f"    gap={r['equity_gap']:+.3f}  {r['AREA_NAME']:<38} "
                 f"need={r['need_score']:.3f}  access={r['access_score']:.3f}")
+
+    # ---- 5a. capacity-weighting patch: OLD vs NEW for the flagged 4 ----
+    n_subway = int((merged["subway_stop_count"] > 0).sum())
+    print("\n" + "-" * 78)
+    print(f"  CAPACITY-WEIGHTING PATCH -- flagged false-positives, OLD vs NEW:")
+    print(f"  {'neighbourhood':<22} {'access old->new':>22}   {'equity_gap old->new':>24}")
+    for nm, old in FLAGGED_OLD.items():
+        r = merged[merged["AREA_NAME"] == nm].iloc[0]
+        da = r["access_score"] - old["access"]
+        dg = r["equity_gap"] - old["gap"]
+        print(f"  {nm:<22} {old['access']:.3f} -> {r['access_score']:.3f} ({da:+.3f})   "
+              f"{old['gap']:+.3f} -> {r['equity_gap']:+.3f} ({dg:+.3f})   "
+              f"[subway stops: {int(r['subway_stop_count'])}]")
+    print(f"\n  neighbourhoods with >= 1 subway-route stop: {n_subway} of 158 "
+          f"(only this subset shifts relative to the rest)")
 
     print("\n" + "-" * 78)
     print("  TOP 10 equity_gap -- most UNDERSERVED (high need, low access):")

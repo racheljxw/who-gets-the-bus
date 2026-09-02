@@ -14,12 +14,23 @@ Steps (see CLAUDE.md section 5 + risk area 3):
      keeping the match with the smallest AREA_SHORT_CODE (deterministic), so no
      stop is ever counted in two neighbourhoods. Report every deduped stop.
   4. Per neighbourhood (LEFT join from all 158 polygons; zero-stop kept):
-       stop_count, neighbourhood_frequency = SUM(trips_per_hour),
+       stop_count,
+       neighbourhood_capacity_weighted_frequency = SUM(capacity_weighted_trips_per_hour),
+       neighbourhood_frequency = SUM(trips_per_hour)   [kept for audit only],
        area_km2, neighbourhood_stop_density = stop_count / area_km2,
-       freq_norm    = min-max(neighbourhood_frequency)     -> 0..1
-       density_norm = min-max(neighbourhood_stop_density)  -> 0..1
+       freq_norm    = min-max(neighbourhood_capacity_weighted_frequency)  -> 0..1
+       density_norm = min-max(neighbourhood_stop_density)                 -> 0..1
        raw_access   = 0.4*freq_norm + 0.6*density_norm
        access_score = raw_access   (already 0..1: weighted sum of two 0..1 terms)
+
+     CAPACITY-WEIGHTING PATCH (2026-09-01, Phase 3 review): freq_norm now uses
+     the *capacity-weighted* frequency (each stop_time scaled by vehicle capacity
+     per GTFS route_type -- subway x15, streetcar x2.5, bus x1; see
+     scripts/02_stop_frequency.py and CLAUDE.md section 5). Before this, sparse
+     subway-served neighbourhoods (North Toronto, Yonge-Doris) scored as
+     "underserved" purely because a subway station is one physical stop while a
+     bus corridor is many -- raw trip counts ignored that a subway train carries
+     ~15x a bus. Plain neighbourhood_frequency is still written for audit.
 
      DEVIATION FROM ORIGINAL SPEC (explicit human decision, 2026-09-01): the
      original spec was raw_access = 0.6*frequency + 0.4*stop_density then a
@@ -102,9 +113,12 @@ def main() -> int:
     print(f"\n  {len(stops)} stops loaded; "
           f"{(stops['trips_per_hour'] > 0).sum()} with trips_per_hour > 0")
 
+    STOP_COLS = ["stop_id", "trips_per_hour", "capacity_weighted_trips_per_hour",
+                 "has_subway_route", "geometry"]
+
     # ---- 3. sjoin intersects + dedup ----
     joined = gpd.sjoin(
-        stops[["stop_id", "trips_per_hour", "geometry"]],
+        stops[STOP_COLS],
         nbhd[["AREA_SHORT_CODE", "AREA_NAME", "geometry"]],
         how="left",
         predicate="intersects",
@@ -122,7 +136,7 @@ def main() -> int:
         # points within RESCUE_TOL_M of a polygon via nearest join; anything
         # further out is genuinely outside Toronto (TTC serves some Mississauga /
         # York Region stops) and is left unassigned.
-        far = stops.loc[unmatched_idx, ["stop_id", "trips_per_hour", "geometry"]]
+        far = stops.loc[unmatched_idx, STOP_COLS]
         near = gpd.sjoin_nearest(
             far, nbhd[["AREA_SHORT_CODE", "AREA_NAME", "geometry"]],
             how="left", max_distance=RESCUE_TOL_M, distance_col="_dist_m",
@@ -138,7 +152,8 @@ def main() -> int:
               f"({(still_out['trips_per_hour'] > 0).sum()} with service -- "
               f"their frequency is not credited to any neighbourhood)")
         matched = pd.concat(
-            [matched, near[["stop_id", "trips_per_hour", "AREA_SHORT_CODE", "AREA_NAME", "geometry"]]],
+            [matched, near[["stop_id", "trips_per_hour", "capacity_weighted_trips_per_hour",
+                            "has_subway_route", "AREA_SHORT_CODE", "AREA_NAME", "geometry"]]],
             ignore_index=True,
         )
         unmatched = still_out
@@ -173,7 +188,10 @@ def main() -> int:
     agg = (
         matched.groupby("AREA_SHORT_CODE")
         .agg(stop_count=("stop_id", "size"),
-             neighbourhood_frequency=("trips_per_hour", "sum"))
+             neighbourhood_frequency=("trips_per_hour", "sum"),
+             neighbourhood_capacity_weighted_frequency=(
+                 "capacity_weighted_trips_per_hour", "sum"),
+             subway_stop_count=("has_subway_route", "sum"))
         .reset_index()
     )
 
@@ -182,10 +200,16 @@ def main() -> int:
     )
     acc["stop_count"] = acc["stop_count"].fillna(0).astype(int)
     acc["neighbourhood_frequency"] = acc["neighbourhood_frequency"].fillna(0.0)
+    acc["neighbourhood_capacity_weighted_frequency"] = (
+        acc["neighbourhood_capacity_weighted_frequency"].fillna(0.0)
+    )
+    acc["subway_stop_count"] = acc["subway_stop_count"].fillna(0).astype(int)
     acc["neighbourhood_stop_density"] = acc["stop_count"] / acc["area_km2"]
 
     # Normalize each term to 0..1 FIRST, then combine (revised formula 2026-09-01).
-    acc["freq_norm"] = minmax(acc["neighbourhood_frequency"])
+    # freq_norm uses the CAPACITY-WEIGHTED frequency (patch 2026-09-01) so subway
+    # capacity is reflected; plain neighbourhood_frequency kept for audit only.
+    acc["freq_norm"] = minmax(acc["neighbourhood_capacity_weighted_frequency"])
     acc["density_norm"] = minmax(acc["neighbourhood_stop_density"])
     acc["raw_access"] = (
         FREQ_WEIGHT * acc["freq_norm"] + DENSITY_WEIGHT * acc["density_norm"]
@@ -195,7 +219,8 @@ def main() -> int:
     acc["access_score"] = acc["raw_access"]
 
     acc = acc[[
-        "AREA_SHORT_CODE", "AREA_NAME", "stop_count", "neighbourhood_frequency",
+        "AREA_SHORT_CODE", "AREA_NAME", "stop_count", "subway_stop_count",
+        "neighbourhood_frequency", "neighbourhood_capacity_weighted_frequency",
         "area_km2", "neighbourhood_stop_density", "freq_norm", "density_norm",
         "raw_access", "access_score",
     ]].sort_values("access_score", ascending=False).reset_index(drop=True)
@@ -212,22 +237,26 @@ def main() -> int:
     print(f"  stops assigned to a neighbourhood: {total_assigned} "
           f"(of {len(stops)} total; {len(unmatched)} outside the boundary set)")
 
-    print("\n  REVISED formula: raw_access = 0.4*freq_norm + 0.6*density_norm  "
+    print("\n  formula: raw_access = 0.4*freq_norm + 0.6*density_norm  "
           "(each term min-max'd to 0..1 first); access_score = raw_access.")
-    print("  raw term ranges (pre-normalization -- the scale gap this revision fixes):")
-    print(f"    neighbourhood_frequency      : {acc['neighbourhood_frequency'].min():.1f} "
+    print("  freq_norm now built from CAPACITY-WEIGHTED frequency (subway x15, "
+          "streetcar x2.5, bus x1) -- patch 2026-09-01.")
+    print("  raw term ranges (pre-normalization):")
+    print(f"    neighbourhood_frequency (plain, audit) : "
+          f"{acc['neighbourhood_frequency'].min():.1f} "
           f".. {acc['neighbourhood_frequency'].max():.1f}  "
           f"(median {acc['neighbourhood_frequency'].median():.1f})")
-    print(f"    neighbourhood_stop_density   : {acc['neighbourhood_stop_density'].min():.1f} "
+    cwf = acc["neighbourhood_capacity_weighted_frequency"]
+    print(f"    neighbourhood_capacity_weighted_freq   : {cwf.min():.1f} "
+          f".. {cwf.max():.1f}  (median {cwf.median():.1f})  <- feeds freq_norm")
+    print(f"    neighbourhood_stop_density             : {acc['neighbourhood_stop_density'].min():.1f} "
           f".. {acc['neighbourhood_stop_density'].max():.1f}  "
           f"(median {acc['neighbourhood_stop_density'].median():.1f})  [stops/km^2]")
-    print(f"    -> ~{acc['neighbourhood_frequency'].max() / acc['neighbourhood_stop_density'].max():.0f}x "
-          f"apart at the top end; now each is min-max'd to 0..1 BEFORE weighting, "
-          f"so both terms have equal reach and the 0.4/0.6 weights actually bite.")
 
     def _row(r):
         return (f"    {r['access_score']:.3f}  {r['AREA_NAME']:<38} "
-                f"stops={r['stop_count']:3d}  freq={r['neighbourhood_frequency']:7.1f} "
+                f"stops={r['stop_count']:3d}  "
+                f"cwfreq={r['neighbourhood_capacity_weighted_frequency']:8.1f} "
                 f"(fn={r['freq_norm']:.3f})  dens={r['neighbourhood_stop_density']:5.1f} "
                 f"(dn={r['density_norm']:.3f})")
 
@@ -239,16 +268,21 @@ def main() -> int:
     for _, r in acc.tail(5).iterrows():
         print(_row(r))
 
-    whc = acc[acc["AREA_NAME"].str.startswith("West Humber")]
-    if len(whc):
-        r = whc.iloc[0]
-        rank = acc.index[acc["AREA_NAME"] == r["AREA_NAME"]][0] + 1
-        print(f"\n  West Humber-Clairville outlier check (compression left as-is, per decision):")
-        print(f"    was access_score 1.000 (rank 1) under old formula")
-        print(f"    now access_score {r['access_score']:.3f} (rank {rank} of 158)  "
-              f"freq_norm={r['freq_norm']:.3f}  density_norm={r['density_norm']:.3f}")
-        print(f"    gap to #2 now {r['access_score'] - acc['access_score'].iloc[1]:+.3f} "
-              f"(was +0.231)")
+    n_subway_nbhd = int((acc["subway_stop_count"] > 0).sum())
+    print(f"\n  neighbourhoods with >= 1 subway-route stop: {n_subway_nbhd} of 158 "
+          f"(the capacity patch only moves this subset relative to the rest)")
+
+    # subway-served neighbourhoods: how the capacity patch moved them
+    print("\n  capacity-weighting effect on subway-served neighbourhoods "
+          "(freq_norm from cap-weighted freq):")
+    for nm in ("North Toronto", "Yonge-Doris", "Church-Wellesley",
+               "North St.James Town", "West Humber-Clairville"):
+        m = acc[acc["AREA_NAME"] == nm]
+        if len(m):
+            r = m.iloc[0]
+            rank = acc.index[acc["AREA_NAME"] == nm][0] + 1
+            print(f"    {nm:<24} access_score={r['access_score']:.3f} (rank {rank}/158)  "
+                  f"fn={r['freq_norm']:.3f}  dn={r['density_norm']:.3f}")
 
     zero = acc[acc["stop_count"] == 0]
     print(f"\n  zero-stop neighbourhoods: {len(zero)}  "
@@ -257,14 +291,7 @@ def main() -> int:
         print(f"    {r['AREA_NAME']:<38}  raw_access={r['raw_access']:.4f}  "
               f"access_score={r['access_score']:.4f}")
 
-    avon = acc[acc["AREA_NAME"] == "Avondale"]
-    if len(avon):
-        r = avon.iloc[0]
-        rank = acc.index[acc["AREA_NAME"] == "Avondale"][0] + 1
-        print(f"\n  Avondale (was the 0.000 floor under old formula):")
-        print(f"    now access_score {r['access_score']:.4f} (rank {rank} of 158, "
-              f"{'still near the bottom' if rank >= 154 else 'MOVED -- investigate'})")
-    print(f"  overall access_score range: {acc['access_score'].min():.4f} "
+    print(f"\n  overall access_score range: {acc['access_score'].min():.4f} "
           f".. {acc['access_score'].max():.4f}")
 
     print("\nPhase 1b done. Next: Phase 2 demographics -> need_score (needs confirmation).")

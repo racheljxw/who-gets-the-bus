@@ -14,8 +14,32 @@ Pipeline:
      (h may be >= 24), never as wall-clock, then compare in seconds.
   4. trips_per_hour(stop) = (qualifying stop_times at that stop) / 2   [2-hour window]
      lat/lon joined from stops.txt.
+  4b. CAPACITY WEIGHTING (2026-09-01 decision -- see CLAUDE.md section 5).
+     Plain trip counts treat a 6-car subway train and a single bus as equal.
+     They aren't: a subway station serves far more passenger capacity per
+     vehicle, so sparse-but-high-capacity subway neighbourhoods (North Toronto,
+     Yonge-Doris) were scoring as "underserved" purely because they have few
+     physical stops. Fix: weight each qualifying stop_time by its route's
+     vehicle capacity, via GTFS route_type (trips.txt -> routes.txt):
+
+       capacity_multiplier = {
+         3  bus        : 1.0    # ~50-passenger standard TTC bus -- baseline
+         0  streetcar  : 2.5    # ~130-passenger low-floor Flexity streetcar
+         1  subway     : 15.0   # ~800-900-passenger 6-car T1 / Toronto Rocket train
+       }
+
+     These are explicit, approximate, sourced-but-not-precise assumptions
+     (nominal service capacities, not crush loads). Any other route_type gets a
+     printed warning and falls back to 1.0 (bus-equivalent) rather than a silent
+     guess. Each stop_time is weighted individually by its own route_type before
+     summing -- a stop served by multiple modes is NOT averaged.
+
+       capacity_weighted_trips_per_hour(stop) =
+         SUM(capacity_multiplier[route_type] for each qualifying stop_time) / 2
+
   5. Write data/processed/stop_frequency.parquet
-     columns: stop_id, stop_lat, stop_lon, trip_count, trips_per_hour
+     columns: stop_id, stop_lat, stop_lon, trip_count, trips_per_hour,
+              capacity_weighted_trip_count, capacity_weighted_trips_per_hour
 
 Phase 1b (spatial join stops -> neighbourhoods) is deliberately NOT done here.
 
@@ -49,6 +73,18 @@ LABOUR_DAY = date(2026, 9, 7)     # service_id 1 removed this day via calendar_d
 PEAK_START_SEC = 7 * 3600         # 07:00:00 -> 25200
 PEAK_END_SEC = 9 * 3600           # 09:00:00 -> 32400
 WINDOW_HOURS = 2.0
+
+# Approximate per-vehicle service capacity by GTFS route_type, normalized to a
+# standard bus = 1.0. Sourced-but-not-precise (2026-09-01 decision, CLAUDE.md
+# section 5): ~50-pax bus, ~130-pax Flexity streetcar, ~800-900-pax 6-car subway
+# train. Unknown route_types warn + fall back to 1.0 (see CAPACITY_FALLBACK).
+CAPACITY_MULTIPLIER = {
+    3: 1.0,    # bus
+    0: 2.5,    # streetcar / tram
+    1: 15.0,   # subway / metro
+}
+CAPACITY_FALLBACK = 1.0
+ROUTE_TYPE_NAME = {0: "streetcar", 1: "subway", 3: "bus"}
 
 
 def gtfs_time_to_seconds(series: pd.Series) -> pd.Series:
@@ -116,6 +152,7 @@ def main() -> int:
     trips = feed.trips
     stop_times = feed.stop_times
     stops = feed.stops
+    routes = feed.routes
     print(f"\n  service_id={WEEKDAY_SERVICE_ID}: {len(trips):,} trips")
 
     raw_rows = count_raw_stop_times_rows(RAW_ZIP)
@@ -140,16 +177,63 @@ def main() -> int:
     print(f"  stop_times rows -- after 7-9am filter: {len(peak):,}  "
           f"({len(peak) / rows_service1:.1%} of service_id=1 rows)")
 
-    # ---- per-stop counts -> trips_per_hour ----
-    counts = (
-        peak.groupby("stop_id").size().rename("trip_count").reset_index()
+    # ---- route_type per qualifying stop_time (trips.txt -> routes.txt) ----
+    route_type = pd.to_numeric(routes["route_type"], errors="coerce").astype("Int64")
+    trip_rt = trips[["trip_id", "route_id"]].merge(
+        routes[["route_id"]].assign(route_type=route_type), on="route_id", how="left"
     )
+    assert trip_rt["route_type"].notna().all(), (
+        "some service_id=1 trips have no route_type after joining routes.txt"
+    )
+    present = sorted(int(x) for x in trip_rt["route_type"].unique())
+    present_labels = ", ".join(
+        "{} ({})".format(t, ROUTE_TYPE_NAME.get(t, "?")) for t in present
+    )
+    print(f"\n  route_type values present among service_id=1 trips: {present_labels}")
+
+    peak = peak.merge(trip_rt[["trip_id", "route_type"]], on="trip_id", how="left")
+    assert peak["route_type"].notna().all(), "some peak stop_times did not match a trip"
+    peak["route_type"] = peak["route_type"].astype(int)
+
+    unknown = sorted(set(peak["route_type"].unique()) - set(CAPACITY_MULTIPLIER))
+    if unknown:
+        for t in unknown:
+            n = int((peak["route_type"] == t).sum())
+            print(f"  WARNING: route_type {t} not in CAPACITY_MULTIPLIER -- "
+                  f"{n:,} peak stop_times default to {CAPACITY_FALLBACK} (bus-equivalent)")
+    peak["capacity_multiplier"] = (
+        peak["route_type"].map(CAPACITY_MULTIPLIER).fillna(CAPACITY_FALLBACK)
+    )
+    print("  capacity weighting applied per stop_time:")
+    for t in present:
+        mult = CAPACITY_MULTIPLIER.get(t, CAPACITY_FALLBACK)
+        n = int((peak["route_type"] == t).sum())
+        print(f"    route_type {t} ({ROUTE_TYPE_NAME.get(t, '?'):<9}) x{mult:<4}  "
+              f"{n:,} peak stop_times")
+
+    # ---- per-stop counts -> trips_per_hour (plain + capacity-weighted) ----
+    peak["_is_subway"] = peak["route_type"] == 1
+    counts = (
+        peak.groupby("stop_id")
+        .agg(trip_count=("trip_id", "size"),
+             capacity_weighted_trip_count=("capacity_multiplier", "sum"),
+             subway_trip_count=("_is_subway", "sum"))
+        .reset_index()
+    )
+    counts["has_subway_route"] = counts["subway_trip_count"] > 0
     counts["trips_per_hour"] = counts["trip_count"] / WINDOW_HOURS
+    counts["capacity_weighted_trips_per_hour"] = (
+        counts["capacity_weighted_trip_count"] / WINDOW_HOURS
+    )
 
     # every stop in stops.txt, so zero-service stops are retained as 0
     out = stops[["stop_id", "stop_lat", "stop_lon"]].merge(counts, on="stop_id", how="left")
     out["trip_count"] = out["trip_count"].fillna(0).astype(int)
     out["trips_per_hour"] = out["trips_per_hour"].fillna(0.0)
+    out["capacity_weighted_trip_count"] = out["capacity_weighted_trip_count"].fillna(0.0)
+    out["capacity_weighted_trips_per_hour"] = out["capacity_weighted_trips_per_hour"].fillna(0.0)
+    out["subway_trip_count"] = out["subway_trip_count"].fillna(0).astype(int)
+    out["has_subway_route"] = out["has_subway_route"].fillna(False).astype(bool)
     out["stop_lat"] = pd.to_numeric(out["stop_lat"], errors="coerce")
     out["stop_lon"] = pd.to_numeric(out["stop_lon"], errors="coerce")
 
@@ -164,17 +248,29 @@ def main() -> int:
     print(f"  total stops in stops.txt              : {len(out):,}")
     print(f"  stops with trips_per_hour > 0         : {len(served):,}")
     print(f"  stops with trips_per_hour == 0        : {len(out) - len(served):,}")
+    print(f"  stops served by a subway route (route_type=1): "
+          f"{int(out['has_subway_route'].sum()):,}")
     print(f"  trips_per_hour  max={served['trips_per_hour'].max():.1f}  "
           f"median={served['trips_per_hour'].median():.1f}  "
           f"mean={served['trips_per_hour'].mean():.2f}")
+    cw = served["capacity_weighted_trips_per_hour"]
+    print(f"  capacity_weighted_trips_per_hour  max={cw.max():.1f}  "
+          f"median={cw.median():.1f}  mean={cw.mean():.2f}  "
+          f"(vs plain -- diverges most at subway/streetcar stops)")
 
-    print("\n  busiest 10 stops (7-9am):")
+    print("\n  busiest 10 stops by plain trips_per_hour (7-9am):")
     top = out.sort_values("trips_per_hour", ascending=False).head(10)
     id_to_name = dict(zip(stops["stop_id"], stops.get("stop_name", pd.Series(dtype=str))))
     for _, r in top.iterrows():
         nm = id_to_name.get(r["stop_id"], "?")
         print(f"    stop {r['stop_id']:>7}  {r['trips_per_hour']:6.1f} tph  "
-              f"({r['trip_count']:3d} in 2h)  {nm}")
+              f"(cap-wt {r['capacity_weighted_trips_per_hour']:7.1f})  {nm}")
+
+    print("\n  busiest 10 stops by capacity_weighted_trips_per_hour (7-9am):")
+    for _, r in out.sort_values("capacity_weighted_trips_per_hour", ascending=False).head(10).iterrows():
+        nm = id_to_name.get(r["stop_id"], "?")
+        print(f"    stop {r['stop_id']:>7}  cap-wt {r['capacity_weighted_trips_per_hour']:7.1f}  "
+              f"(plain {r['trips_per_hour']:6.1f} tph)  {nm}")
 
     # sanity: named landmark stops (substring match on stop_name)
     print("\n  sanity -- known frequent Toronto locations (matching stops):")
