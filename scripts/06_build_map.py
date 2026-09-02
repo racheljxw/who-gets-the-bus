@@ -252,11 +252,75 @@ SHELL_CSS = f"""
   .leaflet-interactive:focus-visible,
   .leaflet-container svg path:focus {{ outline:none; }}
 
+  /* Visible keyboard focus on every custom control -- the browser's default
+     ring is faint on the dark shell. :focus-visible so a plain mouse click
+     still looks clean; keyboard focus gets a clear light outline. */
+  .wgtb-layer:focus-visible,
+  .wgtb-zoom button:focus-visible,
+  .wgtb-export-btn:focus-visible,
+  .wgtb-about-btn:focus-visible,
+  .wgtb-about-close:focus-visible {{
+    outline:2px solid var(--active-border); outline-offset:2px;
+  }}
+
+  /* Screen-reader-only: in the a11y tree and announced, but off-screen (NOT
+     display:none, which would drop it from the a11y tree entirely). */
+  .wgtb-sr-only {{
+    position:absolute !important; width:1px; height:1px;
+    padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0);
+    white-space:nowrap; border:0;
+  }}
+
   .wgtb-app {{
     display:flex; flex-direction:column; gap:14px;
     padding:22px 64px; min-height:100vh;   /* wide side margins on laptop; trimmed on mobile */
   }}
-  .wgtb-title-main {{ font-size:22px; font-weight:600; color:var(--muted-2); }}
+  .wgtb-title {{ display:flex; align-items:flex-start; gap:8px; }}
+  .wgtb-title-main {{ font-size:22px; font-weight:600; color:var(--muted-2); line-height:1.2; }}
+
+  /* About -- a small (i) button, top-aligned with the title text */
+  .wgtb-about-btn {{
+    width:16px; height:16px; margin-top:2px; flex:0 0 auto; padding:0; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    font-family:inherit; font-size:10px; font-style:italic; font-weight:700;
+    border-radius:50%; background:transparent;
+    border:1px solid var(--panel-border); color:var(--muted-2);
+  }}
+  @media (hover:hover) and (pointer:fine) {{
+    .wgtb-about-btn:hover {{ background:var(--active-fill); color:var(--text-active); }}
+  }}
+  .wgtb-about-overlay {{
+    position:fixed; inset:0; z-index:2000; overflow-y:auto;
+    display:flex; align-items:flex-start; justify-content:center;
+    padding:40px 16px; background:rgba(5,2,16,0.74);
+  }}
+  .wgtb-about-overlay[hidden] {{ display:none; }}
+  .wgtb-about {{
+    background:var(--panel); border:1px solid var(--panel-border);
+    border-radius:8px; padding:20px 24px 24px; max-width:640px; width:100%;
+    color:var(--muted-2); font-size:13px; line-height:1.5;
+  }}
+  .wgtb-about-head {{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  }}
+  .wgtb-about h2 {{ font-size:16px; font-weight:600; margin:0 0 4px; color:var(--muted-2); }}
+  .wgtb-about h3 {{
+    font-size:13px; font-weight:600; margin:16px 0 5px; color:var(--muted-2);
+  }}
+  .wgtb-about p {{ margin:0 0 8px; }}
+  .wgtb-about ul {{ margin:0 0 8px; padding-left:18px; }}
+  .wgtb-about li {{ margin:0 0 5px; }}
+  .wgtb-about a {{ color:var(--active-border); }}
+  .wgtb-about-close {{
+    flex:0 0 auto; width:26px; height:26px; padding:0; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; line-height:1;
+    font-family:inherit; font-size:18px;
+    border-radius:4px; background:transparent;
+    border:1px solid var(--panel-border); color:var(--muted-2);
+  }}
+  @media (hover:hover) and (pointer:fine) {{
+    .wgtb-about-close:hover {{ background:var(--active-fill); color:var(--text-active); }}
+  }}
 
   .wgtb-grid {{
     display:grid; grid-template-columns:1fr 200px; gap:14px;
@@ -379,20 +443,106 @@ SHELL_CSS = f"""
 """
 
 
+# "About this map" overlay -- plain-language methodology for a general audience
+# (not a copy of CLAUDE.md's technical notes). Opened by the header (i) button;
+# it is a position:fixed overlay so it is unaffected by the mobile grid re-order.
+ABOUT_HTML = """
+<div class="wgtb-about-overlay" hidden>
+  <div class="wgtb-about" id="wgtb-about-dialog" role="dialog" aria-modal="true"
+       aria-labelledby="wgtb-about-title">
+    <div class="wgtb-about-head">
+      <h2 id="wgtb-about-title">About this map</h2>
+      <button type="button" class="wgtb-about-close" aria-label="Close">&times;</button>
+    </div>
+
+    <p>Every one of Toronto&rsquo;s 158 neighbourhoods is scored on the gap between how
+    much it depends on transit and how well transit actually serves it.</p>
+
+    <h3>The three scores</h3>
+    <ul>
+      <li><strong>Need</strong> &mdash; how transit-dependent a neighbourhood is. We
+      average three things, each ranked from 0 to 1 across the city: the share of
+      residents with low income, the share of commuters who get to work without a car,
+      and how densely people live. Higher means more dependent on transit.</li>
+      <li><strong>Access</strong> &mdash; how well transit serves it. We combine how
+      many stops sit in the neighbourhood per square kilometre with how often vehicles
+      come through in the weekday morning peak (7&ndash;9&nbsp;am), plus partial credit
+      for busy subway and LRT stations just outside the edge. Higher means better
+      served.</li>
+      <li><strong>Equity gap</strong> &mdash; need minus access. A large positive gap
+      (pink) is a neighbourhood that leans on transit but doesn&rsquo;t get much of it.
+      A negative gap (blue) means service runs ahead of need.</li>
+    </ul>
+
+    <h3>Choices worth knowing about</h3>
+    <p>The 2021 Census doesn&rsquo;t publish two of the numbers we wanted, so we used
+    the closest available stand-ins:</p>
+    <ul>
+      <li>There is no &ldquo;low-income households&rdquo; figure, so we use the standard
+      Low-income Measure (LIM-AT) &mdash; the share of people who fall below it.</li>
+      <li>The 2021 Census dropped the vehicle-ownership question, so we use the share of
+      commuters who travel by something other than a car &mdash; walking, cycling,
+      transit &mdash; as a stand-in for not having a vehicle.</li>
+    </ul>
+    <p><strong>Not all transit is equal.</strong> A subway train carries far more people
+    than a bus, so counting stops alone would flatter a neighbourhood served by a single
+    bus route. Each scheduled trip is weighted by vehicle capacity &mdash; roughly
+    bus&nbsp;1&times;, streetcar&nbsp;2.5&times;, LRT&nbsp;6&times;, subway&nbsp;15&times;
+    &mdash; before frequencies are added up.</p>
+    <p><strong>Stations don&rsquo;t stop at the boundary line.</strong> A subway station
+    just outside a neighbourhood still serves the people near it, so every neighbourhood
+    gets partial &ldquo;walkshed&rdquo; credit for rapid-transit stations within
+    500&nbsp;m of its edge &mdash; full credit at the boundary, fading to zero at
+    500&nbsp;m, about a six-minute walk.</p>
+
+    <h3>A known limitation</h3>
+    <p>The transit schedule lists the Bloor-Yonge interchange as two separate stations
+    &mdash; &ldquo;Bloor Station&rdquo; and &ldquo;Yonge Station&rdquo;, about
+    100&nbsp;m apart &mdash; and we don&rsquo;t merge them. Neighbourhoods around that
+    interchange may show slightly more walkshed credit than they strictly should.</p>
+
+    <h3>Data snapshot</h3>
+    <p>Built from City of Toronto open data retrieved 1&nbsp;September&nbsp;2026; the TTC
+    schedule feed is valid 6&nbsp;September to 31&nbsp;October&nbsp;2026. This is a single
+    point-in-time snapshot &mdash; it is not updated as routes, schedules or demographics
+    change.</p>
+
+    <h3>Sources &amp; licence</h3>
+    <p>All data is City of Toronto Open Data, published under the Open Government Licence
+    &ndash; Toronto. The full source links are in the footer at the bottom of the
+    page.</p>
+  </div>
+</div>
+"""
+
+
 def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
                 legends: dict, footer_html: str, data_bounds: tuple) -> tuple[str, str]:
     """Return (scaffold_html, wiring_js). scaffold_html wraps the folium-map div;
     wiring_js is appended after folium's own <script>."""
+    # Native <button>s (Tab-reachable, Enter/Space activate with zero custom JS) in
+    # a role="group"; aria-pressed carries the on/off state. A role="radio" group
+    # would be the other option but that pattern demands arrow-key roving focus --
+    # more JS, and it removes the per-button Tab stop the review asked for.
     rows = "".join(
-        f'<button type="button" class="wgtb-layer{" is-active" if key == "gap" else ""}" '
-        f'data-layer="{key}"><span class="wgtb-dot"></span><span>{label}</span></button>'
+        f'<button type="button" aria-pressed="{"true" if key == "gap" else "false"}" '
+        f'class="wgtb-layer{" is-active" if key == "gap" else ""}" '
+        f'data-layer="{key}" aria-label="Show the {label.lower()} layer">'
+        f'<span class="wgtb-dot" aria-hidden="true"></span><span>{label}</span></button>'
         for key, label in (("gap", "Equity gap"), ("access", "Access"), ("need", "Need"))
     )
     scaffold = (
         '<div class="wgtb-app">'
         '  <header class="wgtb-title">'
         '    <div class="wgtb-title-main">Toronto Transit Equity Map</div>'
+        '    <button type="button" class="wgtb-about-btn" aria-haspopup="dialog" '
+        'aria-expanded="false" aria-controls="wgtb-about-dialog" '
+        'aria-label="About this map: what the scores mean, methodology and data sources">'
+        '<span aria-hidden="true">i</span></button>'
         '  </header>'
+        '  <p class="wgtb-sr-only">This is an interactive colour-coded map and cannot be '
+        'described to a screen reader. Use the &ldquo;Download data&rdquo; button, below the '
+        'legend, to get every neighbourhood&rsquo;s scores as a spreadsheet.</p>'
         '  <div class="wgtb-grid">'
         '    <div class="wgtb-map-panel">'
         f'      <div class="folium-map" id="{map_name}"></div>'
@@ -403,16 +553,17 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         '    </div>'
         '    <aside class="wgtb-side">'
         '      <div class="wgtb-panel wgtb-layers">'
-        '        <div class="wgtb-panel-h">Layers</div>'
-        f'        <div class="wgtb-layer-list">{rows}</div>'
+        '        <div class="wgtb-panel-h" id="wgtb-layers-h">Layers</div>'
+        f'        <div class="wgtb-layer-list" role="group" aria-labelledby="wgtb-layers-h">{rows}</div>'
         '      </div>'
         '      <div class="wgtb-panel wgtb-legend-panel">'
         '        <div class="wgtb-panel-h">Legend</div>'
         '        <div class="wgtb-legend-body"></div>'
         '      </div>'
         '      <div class="wgtb-export-panel">'
-        '        <button type="button" class="wgtb-export-btn">'
-        '          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" '
+        '        <button type="button" class="wgtb-export-btn" '
+        'aria-label="Download all 158 neighbourhood scores as an Excel spreadsheet">'
+        '          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true" '
         'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
         '<path d="M8 2v8m0 0 2.5-2.5M8 10 5.5 7.5"/>'
         '<path d="M2.5 10.5v2A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg>'
@@ -422,6 +573,7 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         '    </aside>'
         '  </div>'
         f'  <footer class="wgtb-footer">{footer_html}</footer>'
+        f'  {ABOUT_HTML}'
         '</div>'
     )
 
@@ -443,7 +595,9 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         "    });\n"
         "    if (TT && MAP.hasLayer(TT) && TT.bringToFront) TT.bringToFront();\n"
         "    document.querySelectorAll('.wgtb-layer').forEach(function (b) {\n"
-        "      b.classList.toggle('is-active', b.getAttribute('data-layer') === k);\n"
+        "      var on = b.getAttribute('data-layer') === k;\n"
+        "      b.classList.toggle('is-active', on);\n"
+        "      b.setAttribute('aria-pressed', on ? 'true' : 'false');\n"
         "    });\n"
         "    if (body) body.innerHTML = LEGENDS[k] || '';\n"
         "  }\n"
@@ -454,6 +608,39 @@ def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
         "  var zo = document.querySelector('.wgtb-zoom-out');\n"
         "  if (zi) zi.addEventListener('click', function () { MAP.zoomIn(); });\n"
         "  if (zo) zo.addEventListener('click', function () { MAP.zoomOut(); });\n"
+        "\n"
+        "  // ---- About dialog (Phase 6a) ----------------------------------------\n"
+        "  var abBtn = document.querySelector('.wgtb-about-btn');\n"
+        "  var abOv = document.querySelector('.wgtb-about-overlay');\n"
+        "  var abClose = abOv && abOv.querySelector('.wgtb-about-close');\n"
+        "  function openAbout() {\n"
+        "    if (!abOv) return;\n"
+        "    abOv.hidden = false;\n"
+        "    if (abBtn) abBtn.setAttribute('aria-expanded', 'true');\n"
+        "    if (abClose) abClose.focus();\n"
+        "  }\n"
+        "  function closeAbout() {\n"
+        "    if (!abOv) return;\n"
+        "    abOv.hidden = true;\n"
+        "    if (abBtn) { abBtn.setAttribute('aria-expanded', 'false'); abBtn.focus(); }\n"
+        "  }\n"
+        "  if (abBtn) abBtn.addEventListener('click', openAbout);\n"
+        "  if (abClose) abClose.addEventListener('click', closeAbout);\n"
+        "  if (abOv) abOv.addEventListener('click', function (e) {\n"
+        "    if (e.target === abOv) closeAbout();\n"
+        "  });\n"
+        "  document.addEventListener('keydown', function (e) {\n"
+        "    if (e.key === 'Escape' && abOv && !abOv.hidden) closeAbout();\n"
+        "  });\n"
+        "  // keep Tab inside the dialog while it is open (simple focus trap)\n"
+        "  if (abOv) abOv.addEventListener('keydown', function (e) {\n"
+        "    if (e.key !== 'Tab') return;\n"
+        "    var f = abOv.querySelectorAll('button, a[href]');\n"
+        "    if (!f.length) return;\n"
+        "    var first = f[0], last = f[f.length - 1];\n"
+        "    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }\n"
+        "    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }\n"
+        "  });\n"
         "\n"
         "  // ---- spreadsheet export (Phase 5) ------------------------------------\n"
         "  // Pulls the already-loaded feature properties straight off an in-memory\n"
