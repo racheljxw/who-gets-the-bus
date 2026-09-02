@@ -20,26 +20,39 @@ Pipeline:
      vehicle, so sparse-but-high-capacity subway neighbourhoods (North Toronto,
      Yonge-Doris) were scoring as "underserved" purely because they have few
      physical stops. Fix: weight each qualifying stop_time by its route's
-     vehicle capacity, via GTFS route_type (trips.txt -> routes.txt):
+     vehicle capacity, via GTFS route_type + route_long_name.
 
-       capacity_multiplier = {
-         3  bus        : 1.0    # ~50-passenger standard TTC bus -- baseline
-         0  streetcar  : 2.5    # ~130-passenger low-floor Flexity streetcar
-         1  subway     : 15.0   # ~800-900-passenger 6-car T1 / Toronto Rocket train
-       }
+     PATCH 2 / FIX A (2026-09-01) -- split route_type=0 into legacy streetcar
+     vs modern LRT. This feed codes BOTH the legacy streetcar network (Queen,
+     King, Spadina, ...) AND the new Flexity-Freedom light-rail lines
+     ("Line 5 Eglinton", "Line 6 Finch West") as route_type=0. They are very
+     different vehicles, so we classify per route:
 
-     These are explicit, approximate, sourced-but-not-precise assumptions
-     (nominal service capacities, not crush loads). Any other route_type gets a
-     printed warning and falls back to 1.0 (bus-equivalent) rather than a silent
-     guess. Each stop_time is weighted individually by its own route_type before
-     summing -- a stop served by multiple modes is NOT averaged.
+       mode      multiplier  basis (normalized to standard bus = 1.0)
+       bus        1.0    ~50-passenger standard TTC bus -- the baseline
+       streetcar  2.5    ~130-passenger single low-floor Flexity Outlook streetcar
+       lrt        6.0    Flexity Freedom LRVs run COUPLED, ~295-300 passengers per
+                         typical Line 5 / Line 6 train -- intermediate between a
+                         single streetcar and a subway train, equal to neither
+       subway     15.0   ~800-900-passenger 6-car T1 / Toronto Rocket trainset
+
+     "lrt" = route_type==0 AND route_long_name begins "Line <digit>" (confirmed
+     by printing every route_type=0 route in this feed first, not hard-coded).
+     All other route_type==0 -> "streetcar". Unknown route_type -> warning + 1.0.
+     Each stop_time is weighted individually by its own mode before summing -- a
+     stop served by multiple modes is NOT averaged.
 
        capacity_weighted_trips_per_hour(stop) =
-         SUM(capacity_multiplier[route_type] for each qualifying stop_time) / 2
+         SUM(multiplier[mode of that stop_time]) / 2
+
+     A stop is flagged has_rapid_transit if any qualifying stop_time is subway
+     OR lrt -- this drives Fix B's 500 m walkshed credit in 03_access_score.py.
 
   5. Write data/processed/stop_frequency.parquet
-     columns: stop_id, stop_lat, stop_lon, trip_count, trips_per_hour,
-              capacity_weighted_trip_count, capacity_weighted_trips_per_hour
+     columns: stop_id, stop_name, parent_station, stop_lat, stop_lon, trip_count,
+              trips_per_hour, capacity_weighted_trip_count,
+              capacity_weighted_trips_per_hour, subway_trip_count,
+              has_subway_route, rapid_transit_trip_count, has_rapid_transit
 
 Phase 1b (spatial join stops -> neighbourhoods) is deliberately NOT done here.
 
@@ -50,6 +63,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import zipfile
 from datetime import date, timedelta
@@ -74,17 +88,36 @@ PEAK_START_SEC = 7 * 3600         # 07:00:00 -> 25200
 PEAK_END_SEC = 9 * 3600           # 09:00:00 -> 32400
 WINDOW_HOURS = 2.0
 
-# Approximate per-vehicle service capacity by GTFS route_type, normalized to a
-# standard bus = 1.0. Sourced-but-not-precise (2026-09-01 decision, CLAUDE.md
-# section 5): ~50-pax bus, ~130-pax Flexity streetcar, ~800-900-pax 6-car subway
-# train. Unknown route_types warn + fall back to 1.0 (see CAPACITY_FALLBACK).
+# Approximate per-vehicle service capacity by mode, normalized to a standard
+# bus = 1.0. Sourced-but-not-precise (2026-09-01 decisions, CLAUDE.md section 5):
+#   bus       ~50 passengers  -- standard TTC bus, the baseline
+#   streetcar ~130            -- one low-floor Flexity Outlook streetcar
+#   lrt       ~295-300        -- Line 5/6 Flexity Freedom LRVs run COUPLED (Fix A,
+#                               patch 2); intermediate between streetcar & subway
+#   subway    ~800-900        -- 6-car T1 / Toronto Rocket trainset
+# Unknown mode ("other") warns + falls back to 1.0 (see CAPACITY_FALLBACK).
 CAPACITY_MULTIPLIER = {
-    3: 1.0,    # bus
-    0: 2.5,    # streetcar / tram
-    1: 15.0,   # subway / metro
+    "bus": 1.0,
+    "streetcar": 2.5,
+    "lrt": 6.0,
+    "subway": 15.0,
 }
 CAPACITY_FALLBACK = 1.0
-ROUTE_TYPE_NAME = {0: "streetcar", 1: "subway", 3: "bus"}
+RAPID_TRANSIT_MODES = {"subway", "lrt"}   # feeds Fix B's walkshed credit
+# route_type=0 route is modern LRT (not a legacy streetcar) iff its long name
+# looks like "Line 5 Eglinton" / "Line 6 Finch West". Confirmed by printing every
+# route_type=0 route in the feed before this is applied -- see main().
+LRT_LONGNAME_RE = re.compile(r"^\s*Line\s+\d")
+
+
+def classify_mode(route_type: int, route_long_name: str) -> str:
+    if route_type == 1:
+        return "subway"
+    if route_type == 3:
+        return "bus"
+    if route_type == 0:
+        return "lrt" if LRT_LONGNAME_RE.match(str(route_long_name or "")) else "streetcar"
+    return "other"
 
 
 def gtfs_time_to_seconds(series: pd.Series) -> pd.Series:
@@ -177,63 +210,88 @@ def main() -> int:
     print(f"  stop_times rows -- after 7-9am filter: {len(peak):,}  "
           f"({len(peak) / rows_service1:.1%} of service_id=1 rows)")
 
-    # ---- route_type per qualifying stop_time (trips.txt -> routes.txt) ----
+    # ---- route_type / mode per qualifying stop_time (trips.txt -> routes.txt) ----
     route_type = pd.to_numeric(routes["route_type"], errors="coerce").astype("Int64")
+    routes_slim = routes[["route_id", "route_short_name", "route_long_name"]].assign(
+        route_type=route_type
+    )
+
+    # FIX A step 1: print EVERY route_type=0 route so the streetcar/LRT split is
+    # confirmed from the feed, not guessed.
+    rt0 = routes_slim[routes_slim["route_type"] == 0]
+    print(f"\n  route_type=0 routes in this feed ({len(rt0)}): "
+          f"legacy streetcar vs modern LRT (Fix A) --")
+    for _, r in rt0.sort_values("route_id").iterrows():
+        mode = classify_mode(0, r["route_long_name"])
+        print(f"    route_id {str(r['route_id']):<5} short={str(r['route_short_name']):<6} "
+              f"long={str(r['route_long_name'])!r:<26} -> {mode}")
+
+    routes_slim["mode"] = [
+        classify_mode(int(rt) if pd.notna(rt) else -1, ln)
+        for rt, ln in zip(routes_slim["route_type"], routes_slim["route_long_name"])
+    ]
     trip_rt = trips[["trip_id", "route_id"]].merge(
-        routes[["route_id"]].assign(route_type=route_type), on="route_id", how="left"
+        routes_slim[["route_id", "route_type", "mode"]], on="route_id", how="left"
     )
     assert trip_rt["route_type"].notna().all(), (
         "some service_id=1 trips have no route_type after joining routes.txt"
     )
     present = sorted(int(x) for x in trip_rt["route_type"].unique())
-    present_labels = ", ".join(
-        "{} ({})".format(t, ROUTE_TYPE_NAME.get(t, "?")) for t in present
-    )
-    print(f"\n  route_type values present among service_id=1 trips: {present_labels}")
+    print(f"\n  route_type values present among service_id=1 trips: {present}")
 
-    peak = peak.merge(trip_rt[["trip_id", "route_type"]], on="trip_id", how="left")
-    assert peak["route_type"].notna().all(), "some peak stop_times did not match a trip"
-    peak["route_type"] = peak["route_type"].astype(int)
+    peak = peak.merge(trip_rt[["trip_id", "mode"]], on="trip_id", how="left")
+    assert peak["mode"].notna().all(), "some peak stop_times did not match a trip"
 
-    unknown = sorted(set(peak["route_type"].unique()) - set(CAPACITY_MULTIPLIER))
+    unknown = sorted(set(peak["mode"].unique()) - set(CAPACITY_MULTIPLIER))
     if unknown:
-        for t in unknown:
-            n = int((peak["route_type"] == t).sum())
-            print(f"  WARNING: route_type {t} not in CAPACITY_MULTIPLIER -- "
+        for m in unknown:
+            n = int((peak["mode"] == m).sum())
+            print(f"  WARNING: mode {m!r} not in CAPACITY_MULTIPLIER -- "
                   f"{n:,} peak stop_times default to {CAPACITY_FALLBACK} (bus-equivalent)")
     peak["capacity_multiplier"] = (
-        peak["route_type"].map(CAPACITY_MULTIPLIER).fillna(CAPACITY_FALLBACK)
+        peak["mode"].map(CAPACITY_MULTIPLIER).fillna(CAPACITY_FALLBACK)
     )
-    print("  capacity weighting applied per stop_time:")
-    for t in present:
-        mult = CAPACITY_MULTIPLIER.get(t, CAPACITY_FALLBACK)
-        n = int((peak["route_type"] == t).sum())
-        print(f"    route_type {t} ({ROUTE_TYPE_NAME.get(t, '?'):<9}) x{mult:<4}  "
-              f"{n:,} peak stop_times")
+    print("\n  capacity weighting applied per stop_time (by mode):")
+    for m in ["bus", "streetcar", "lrt", "subway", "other"]:
+        n = int((peak["mode"] == m).sum())
+        if n:
+            print(f"    {m:<10} x{CAPACITY_MULTIPLIER.get(m, CAPACITY_FALLBACK):<4}  "
+                  f"{n:,} peak stop_times")
 
     # ---- per-stop counts -> trips_per_hour (plain + capacity-weighted) ----
-    peak["_is_subway"] = peak["route_type"] == 1
+    peak["_is_subway"] = peak["mode"] == "subway"
+    peak["_is_rapid"] = peak["mode"].isin(RAPID_TRANSIT_MODES)
     counts = (
         peak.groupby("stop_id")
         .agg(trip_count=("trip_id", "size"),
              capacity_weighted_trip_count=("capacity_multiplier", "sum"),
-             subway_trip_count=("_is_subway", "sum"))
+             subway_trip_count=("_is_subway", "sum"),
+             rapid_transit_trip_count=("_is_rapid", "sum"))
         .reset_index()
     )
     counts["has_subway_route"] = counts["subway_trip_count"] > 0
+    counts["has_rapid_transit"] = counts["rapid_transit_trip_count"] > 0
     counts["trips_per_hour"] = counts["trip_count"] / WINDOW_HOURS
     counts["capacity_weighted_trips_per_hour"] = (
         counts["capacity_weighted_trip_count"] / WINDOW_HOURS
     )
 
-    # every stop in stops.txt, so zero-service stops are retained as 0
-    out = stops[["stop_id", "stop_lat", "stop_lon"]].merge(counts, on="stop_id", how="left")
+    # every stop in stops.txt, so zero-service stops are retained as 0.
+    # stop_name + parent_station carried through for downstream audit trails
+    # (Fix B walkshed platform->station dedup).
+    stop_cols = ["stop_id", "stop_lat", "stop_lon"]
+    for extra in ("stop_name", "parent_station"):
+        if extra in stops.columns:
+            stop_cols.insert(1, extra)
+    out = stops[stop_cols].merge(counts, on="stop_id", how="left")
     out["trip_count"] = out["trip_count"].fillna(0).astype(int)
     out["trips_per_hour"] = out["trips_per_hour"].fillna(0.0)
     out["capacity_weighted_trip_count"] = out["capacity_weighted_trip_count"].fillna(0.0)
     out["capacity_weighted_trips_per_hour"] = out["capacity_weighted_trips_per_hour"].fillna(0.0)
     out["subway_trip_count"] = out["subway_trip_count"].fillna(0).astype(int)
     out["has_subway_route"] = out["has_subway_route"].fillna(False).astype(bool)
+    out["rapid_transit_trip_count"] = out["rapid_transit_trip_count"].fillna(0).astype(int)
+    out["has_rapid_transit"] = out["has_rapid_transit"].fillna(False).astype(bool)
     out["stop_lat"] = pd.to_numeric(out["stop_lat"], errors="coerce")
     out["stop_lon"] = pd.to_numeric(out["stop_lon"], errors="coerce")
 
@@ -248,8 +306,10 @@ def main() -> int:
     print(f"  total stops in stops.txt              : {len(out):,}")
     print(f"  stops with trips_per_hour > 0         : {len(served):,}")
     print(f"  stops with trips_per_hour == 0        : {len(out) - len(served):,}")
-    print(f"  stops served by a subway route (route_type=1): "
+    print(f"  stops served by a subway route (route_type=1)   : "
           f"{int(out['has_subway_route'].sum()):,}")
+    print(f"  stops served by rapid transit (subway OR Line 5/6): "
+          f"{int(out['has_rapid_transit'].sum()):,}")
     print(f"  trips_per_hour  max={served['trips_per_hour'].max():.1f}  "
           f"median={served['trips_per_hour'].median():.1f}  "
           f"mean={served['trips_per_hour'].mean():.2f}")
