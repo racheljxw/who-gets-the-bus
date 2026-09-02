@@ -1,5 +1,11 @@
 """
 Phase 4 -- build the interactive folium map (output/index.html).
+Phase 4 UI patch (2026-09-02) -- folium's default chrome is replaced with a custom
+dark UI: a page shell (title block + CSS grid), a hand-built layers control, a
+single Legend panel, and a custom zoom pill. folium still renders the Leaflet map
+and the choropleth / tooltip layers; everything visual around it is post-processed
+onto the rendered HTML (see build_shell / SHELL_CSS / SHELL_JS below). No scoring
+or data logic changed.
 
 Input:
   data/processed/equity.geojson   (Phase 3, 158 polygons EPSG:4326, scores locked)
@@ -11,16 +17,17 @@ Output:
   output/index.html               self-contained Leaflet map (folium embeds its own JS/CSS)
 
 What the map has (CLAUDE.md section 1):
-  * one base map centered on Toronto
-  * THREE choropleth layers, radio-select (overlay=False -> LayerControl renders them as
-    a single-choice group so only one is ever painted):
-       - "Transit Equity Gap"  equity_gap   diverging RdYlBu_r, symmetric bins centered at 0
-                                            -- shown by default
-       - "Transit Access"      access_score sequential YlOrRd, 0 -> max
-       - "Need"                need_score   sequential YlOrRd, 0 -> max
-  * ONE always-on transparent GeoJson layer on top carrying the hover tooltip, so the same
-    per-neighbourhood readout works no matter which choropleth is active
-  * a LayerControl, a title card, and a licence-attribution footer
+  * one base map centered on Toronto (Esri dark-gray canvas -- keyless, matches the dark UI)
+  * THREE choropleth layers, one painted at a time -- switched by the custom Layers control,
+    NOT folium's LayerControl (removed):
+       - "Equity Gap"  equity_gap   diverging sky-blue->hot-pink, symmetric bins centred on 0
+                                     -- shown by default
+       - "Access"      access_score sequential YlOrRd, 0 -> max
+       - "Need"        need_score   sequential YlOrRd, 0 -> max
+  * ONE always-on transparent GeoJson layer on top carrying the hover tooltip (unchanged),
+    kept in front on every layer switch via bringToFront()
+  * a title block, a Legend panel that swaps with the active layer, a custom zoom control,
+    and a licence-attribution footer
 
 Run:
     venv/Scripts/python scripts/06_build_map.py
@@ -28,22 +35,19 @@ Run:
 
 from __future__ import annotations
 
-import os
-import sys
-
-import re
-import urllib.request
-
+import base64
 import json
+import os
+import re
+import sys
+import urllib.request
 
 import branca.colormap as cm
 import folium
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from branca.element import MacroElement
 from folium.features import GeoJsonTooltip
-from jinja2 import Template
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -62,13 +66,15 @@ DEFAULT_ZOOM = 11                  # shows all of Toronto with a little margin
 GTFS_VALID = "TTC GTFS feed valid 2026-09-06 to 2026-10-31"
 DATA_SNAPSHOT = "Open data retrieved 2026-09-01"
 
-# Basemap: Esri "World Light Gray" (base + a labels layer that rides ON TOP of the
-# choropleth so place names stay readable). Keyless, muted -- CartoDB Positron, the
-# usual choice, now serves an "API KEY REQUIRED" watermark for keyless use.
+# Basemap: Esri "Dark Gray Canvas" (base + a labels layer that rides ON TOP of the
+# choropleth so place names stay readable). Keyless like the light-gray canvas the
+# earlier build used -- swapped to the dark variant so the map reads with the dark
+# UI shell instead of glowing white inside it. CartoDB dark_matter, the other usual
+# pick, now serves an "API KEY REQUIRED" watermark for keyless use.
 ESRI_BASE_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
-                 "World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}")
+                 "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}")
 ESRI_REF_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
-                "World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}")
+                "World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}")
 ESRI_ATTR = ("Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, "
              "&copy; OpenStreetMap contributors")
 
@@ -87,6 +93,83 @@ LICENCE_HTML = (
     f"Basemap: {ESRI_ATTR}."
 )
 
+# ---- palette (confirmed design 2026-09-01) -------------------------------------
+C_BG = "#0A0428"          # page background
+C_PANEL = "#221C3F"       # panel background
+C_PANEL_BORDER = "#C6C0E6"
+C_MUTED = "#9286D0"       # inactive dot outline / subtitle / secondary text
+C_MUTED_2 = "#C6C0E6"     # primary panel text
+C_ACTIVE_FILL = "#24166D"
+C_ACTIVE_BORDER = "#D9D2FF"
+C_TEXT_ACTIVE = "#f4f4f8"
+
+# 6-step diverging legend/choropleth ramp (blue = over-served, pink = underserved).
+# Neon deep-indigo -> hot-pink (2026-09-02 tweak). The blue half is a smooth
+# interpolation out of the #3E15C6 endpoint (was a jump straight to cyan); the pink
+# half is unchanged. Same semantics, brighter on the dark basemap. Applied to BOTH
+# the gap choropleth and its legend. Access/Need keep the sequential YlOrRd ramp.
+GAP_COLORS = ["#3E15C6", "#7B5FDB", "#B7A9F0", "#ffafcc", "#ff5da2", "#ff006e"]
+GAP_KEY_BLUE = "#7B5FDB"   # legend key swatch / callout for the over-served end
+GAP_KEY_PINK = "#ff5da2"   # legend key swatch / callout for the underserved end
+YLORRD = ["#ffffcc", "#ffeda0", "#fed976", "#feb24c", "#fd8d3c",
+          "#fc4e2a", "#e31a1c", "#bd0026", "#800026"]
+
+GOOGLE_FONT_URL = ("https://fonts.googleapis.com/css2?"
+                   "family=Noto+Sans:wght@400;500;700&display=swap")
+
+_CACHE = os.path.join(os.environ.get("TEMP", "/tmp"), "wgtb_webassets")
+_CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _download(url: str, ua: str = "wgtb-build") -> bytes | None:
+    """Fetch a URL once, disk-cached, returning raw bytes (or None on failure)."""
+    os.makedirs(_CACHE, exist_ok=True)
+    key = os.path.join(_CACHE, re.sub(r"[^A-Za-z0-9._-]", "_", ua + "|" + url)[:180])
+    if os.path.isfile(key):
+        return open(key, "rb").read()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
+        with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310
+            body = r.read()
+        open(key, "wb").write(body)
+        return body
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN could not fetch {url}: {e}")
+        return None
+
+
+def vendor_google_font(html: str) -> str:
+    """Replace the fonts.googleapis.com <link> with an inline <style> whose
+    @font-face src is a base64 data: URI per weight, so the published page pulls
+    Noto Sans with zero runtime third-party fetches (CLAUDE.md section 2). A
+    Chrome UA is needed for googleapis to answer with woff2. On any failure the
+    <link> is left in place (runtime fallback) with a warning."""
+    m = re.search(r'<link[^>]+href="(https://fonts\.googleapis\.com/[^"]+)"[^>]*>', html)
+    if not m:
+        return html
+    css_bytes = _download(m.group(1), ua=_CHROME_UA)
+    if css_bytes is None:
+        return html
+    css = css_bytes.decode("utf-8", "replace")
+    # Noto Sans ships ~8 unicode subsets per weight; the page is English + a few
+    # punctuation/symbol glyphs, so keep only the latin blocks -- inlining all of
+    # them adds ~2 MB of base64 for glyphs that never render.
+    keep = []
+    for block in re.split(r"(?=/\* [\w-]+ \*/)", css):
+        label = re.match(r"/\* ([\w-]+) \*/", block.strip())
+        if label and label.group(1) not in ("latin", "latin-ext"):
+            continue
+        keep.append(block)
+    css = "".join(keep)
+    for fm in re.finditer(r'url\((https://fonts\.gstatic\.com/[^)]+)\)', css):
+        raw = _download(fm.group(1), ua=_CHROME_UA)
+        if raw is None:
+            continue
+        b64 = base64.b64encode(raw).decode("ascii")
+        css = css.replace(fm.group(1), f"data:font/woff2;base64,{b64}")
+    return html.replace(m.group(0), f"<style>\n{css}\n</style>")
+
 
 def inline_web_assets(html: str) -> str:
     """Fetch every CDN <script src>/<link href> once and inline it, so the saved
@@ -94,33 +177,14 @@ def inline_web_assets(html: str) -> str:
     always streams those). Folium 0.20 links these from CDNs by default; the
     project ships as static files, so we vendor them into the one file.
     A fetch failure leaves that tag as-is and prints a warning."""
-    cache = os.path.join(
-        os.environ.get("TEMP", "/tmp"), "wgtb_webassets"
-    )
-    os.makedirs(cache, exist_ok=True)
-
-    def _get(url: str) -> str | None:
-        key = os.path.join(cache, re.sub(r"[^A-Za-z0-9._-]", "_", url))
-        if os.path.isfile(key):
-            return open(key, encoding="utf-8").read()
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "wgtb-build"})
-            with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310
-                body = r.read().decode("utf-8", "replace")
-            open(key, "w", encoding="utf-8").write(body)
-            return body
-        except Exception as e:  # noqa: BLE001
-            print(f"  WARN could not vendor {url}: {e}")
-            return None
-
     for m in re.finditer(r'<script src="(https?://[^"]+)"></script>', html):
-        body = _get(m.group(1))
+        body = _download(m.group(1))
         if body is not None:
-            html = html.replace(m.group(0), f"<script>\n{body}\n</script>")
+            html = html.replace(m.group(0), f"<script>\n{body.decode('utf-8', 'replace')}\n</script>")
     for m in re.finditer(r'<link rel="stylesheet" href="(https?://[^"]+)"/?>', html):
-        body = _get(m.group(1))
+        body = _download(m.group(1))
         if body is not None:
-            html = html.replace(m.group(0), f"<style>\n{body}\n</style>")
+            html = html.replace(m.group(0), f"<style>\n{body.decode('utf-8', 'replace')}\n</style>")
     return html
 
 
@@ -129,6 +193,250 @@ def _fmt(v, spec):
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "—"
     return format(v, spec)
+
+
+# -----------------------------------------------------------------------------
+#  Custom dark-UI shell -- CSS, page scaffold, and the layer/zoom wiring JS.
+#  These are string-injected onto folium's rendered HTML (folium 0.20 has no
+#  templating hook for a surrounding page layout, and its LayerControl markup is
+#  not reusable for this design -- see build_map notes at the bottom of the file).
+# -----------------------------------------------------------------------------
+
+SHELL_CSS = f"""
+<style>
+  :root {{
+    --bg:{C_BG}; --panel:{C_PANEL}; --panel-border:{C_PANEL_BORDER};
+    --muted:{C_MUTED}; --muted-2:{C_MUTED_2};
+    --active-fill:{C_ACTIVE_FILL}; --active-border:{C_ACTIVE_BORDER};
+    --text-active:{C_TEXT_ACTIVE};
+  }}
+  * {{ box-sizing:border-box; }}
+  html, body {{
+    width:100%; min-height:100%; margin:0; padding:0;
+    background:var(--bg); color:var(--muted-2);
+    font-family:"Noto Sans", sans-serif;
+  }}
+  /* folium ships html,body{{height:100%}} and #map{{position:absolute;inset:0}};
+     override so the map lives inside our panel instead of filling the viewport. */
+  .folium-map {{
+    position:absolute !important; inset:0 !important;
+    width:100% !important; height:100% !important;
+  }}
+  /* Noto Sans everywhere -- incl. Leaflet's own chrome and the hover tooltip,
+     whose inline style would otherwise fall back to system-ui. */
+  .leaflet-container {{ background:var(--panel); }}
+  .leaflet-container, .leaflet-container *,
+  .leaflet-tooltip, .leaflet-popup, .leaflet-control {{
+    font-family:"Noto Sans", sans-serif !important;
+  }}
+  /* Leaflet leaves a browser focus ring on an SVG path after a click -- it
+     renders as a black bounding-box rectangle around the neighbourhood. */
+  .leaflet-interactive:focus,
+  .leaflet-interactive:focus-visible,
+  .leaflet-container svg path:focus {{ outline:none; }}
+
+  .wgtb-app {{
+    display:flex; flex-direction:column; gap:14px;
+    padding:22px 64px; min-height:100vh;   /* wide side margins on laptop; trimmed on mobile */
+  }}
+  .wgtb-title-main {{ font-size:22px; font-weight:600; color:var(--muted-2); }}
+
+  .wgtb-grid {{
+    display:grid; grid-template-columns:1fr 200px; gap:14px;
+    flex:1 1 auto; min-height:0;
+  }}
+  .wgtb-map-panel {{
+    position:relative; overflow:hidden;
+    background:var(--panel); border:1px solid var(--panel-border); border-radius:6px;
+    min-height:460px;
+  }}
+  .wgtb-side {{ display:flex; flex-direction:column; gap:14px; }}
+  .wgtb-panel {{
+    background:var(--panel); border:1px solid var(--panel-border);
+    border-radius:6px; padding:12px;
+  }}
+  .wgtb-panel-h {{
+    font-size:13px; font-weight:500; color:var(--muted-2); margin-bottom:9px;
+  }}
+
+  /* Layers -- desktop: stacked rectangles */
+  .wgtb-layer-list {{ display:flex; flex-direction:column; gap:7px; }}
+  .wgtb-layer {{
+    display:flex; align-items:center; gap:8px; width:100%;
+    padding:7px 9px; border-radius:4px;
+    font-family:inherit; font-size:13px; text-align:left; cursor:pointer;
+    background:transparent; border:1px solid var(--muted); color:var(--muted-2);
+  }}
+  .wgtb-layer .wgtb-dot {{
+    width:9px; height:9px; border-radius:50%; flex:0 0 auto;
+    background:transparent; border:1px solid var(--muted);
+  }}
+  .wgtb-layer.is-active {{
+    background:var(--active-fill); border-color:var(--active-border);
+    color:var(--text-active);
+  }}
+  .wgtb-layer.is-active .wgtb-dot {{
+    background:var(--active-border); border-color:var(--active-border);
+  }}
+
+  /* Legend */
+  .wgtb-legend-bar {{
+    display:flex; width:100%; height:12px; border-radius:2px; overflow:hidden;
+  }}
+  .wgtb-legend-bar span {{ flex:1 1 0; }}
+  .wgtb-legend-ends {{
+    display:flex; justify-content:space-between;
+    font-size:10px; color:var(--muted); margin-top:4px;
+  }}
+  .wgtb-legend-key {{
+    display:flex; align-items:center; gap:6px;
+    font-size:10.5px; color:var(--muted-2); margin-top:6px; line-height:1.35;
+  }}
+  .wgtb-legend-key i {{
+    width:10px; height:10px; border-radius:2px; flex:0 0 auto; display:inline-block;
+  }}
+  .wgtb-legend-note {{
+    font-size:10px; color:var(--muted); margin-top:6px; line-height:1.35;
+  }}
+
+  /* Custom zoom control -- joined pill, bottom-right inside the map panel */
+  .wgtb-zoom {{
+    position:absolute; right:12px; bottom:12px; z-index:1000;
+    display:flex; border-radius:4px; overflow:hidden;
+    background:var(--panel); border:1px solid var(--panel-border);
+  }}
+  .wgtb-zoom button {{
+    width:28px; height:28px; padding:0; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+    font-family:inherit; font-size:16px; cursor:pointer;
+    background:transparent; border:0; color:var(--muted-2);
+  }}
+  .wgtb-zoom button:first-child {{ border-right:1px solid var(--panel-border); }}
+  .wgtb-zoom button:hover {{ background:var(--active-fill); color:var(--text-active); }}
+
+  .wgtb-footer {{ font-size:10px; color:var(--muted); line-height:1.4; }}
+  .wgtb-footer a {{ color:var(--muted-2); }}
+
+  @media (max-width:768px) {{
+    /* flatten the nesting so title / layers / map / legend / footer are all
+       direct flex items of .wgtb-app and can be re-ordered vertically */
+    .wgtb-grid, .wgtb-side {{ display:contents; }}
+    .wgtb-app        {{ padding:16px; }}
+    .wgtb-title      {{ order:1; }}
+    .wgtb-layers     {{ order:2; }}
+    .wgtb-map-panel  {{ order:3; min-height:60vh; }}
+    .wgtb-legend-panel {{ order:4; }}
+    .wgtb-footer     {{ order:5; }}
+
+    .wgtb-title-main {{ font-size:18px; }}
+
+    /* Layers -- mobile: separate pill buttons in a row, thinner than desktop rows.
+       The radio dot is desktop-only; the pills read as a segmented control. */
+    .wgtb-layer-list {{ flex-direction:row; gap:8px; }}
+    .wgtb-layer {{
+      flex:1 1 0; justify-content:center; gap:0;
+      padding:5px 8px; border-radius:999px;
+      background:var(--panel); border-color:var(--muted);
+    }}
+    .wgtb-layer .wgtb-dot {{ display:none; }}
+    .wgtb-layer.is-active {{ background:var(--active-fill); border-color:var(--active-border); }}
+  }}
+</style>
+"""
+
+
+def build_shell(map_name: str, layer_js: dict, tooltip_js: str,
+                legends: dict, footer_html: str, data_bounds: tuple) -> tuple[str, str]:
+    """Return (scaffold_html, wiring_js). scaffold_html wraps the folium-map div;
+    wiring_js is appended after folium's own <script>."""
+    rows = "".join(
+        f'<button type="button" class="wgtb-layer{" is-active" if key == "gap" else ""}" '
+        f'data-layer="{key}"><span class="wgtb-dot"></span><span>{label}</span></button>'
+        for key, label in (("gap", "Equity gap"), ("access", "Access"), ("need", "Need"))
+    )
+    scaffold = (
+        '<div class="wgtb-app">'
+        '  <header class="wgtb-title">'
+        '    <div class="wgtb-title-main">Toronto Transit Equity Map</div>'
+        '  </header>'
+        '  <div class="wgtb-grid">'
+        '    <div class="wgtb-map-panel">'
+        f'      <div class="folium-map" id="{map_name}"></div>'
+        '      <div class="wgtb-zoom">'
+        '        <button type="button" class="wgtb-zoom-out" aria-label="Zoom out">&#8722;</button>'
+        '        <button type="button" class="wgtb-zoom-in" aria-label="Zoom in">+</button>'
+        '      </div>'
+        '    </div>'
+        '    <aside class="wgtb-side">'
+        '      <div class="wgtb-panel wgtb-layers">'
+        '        <div class="wgtb-panel-h">Layers</div>'
+        f'        <div class="wgtb-layer-list">{rows}</div>'
+        '      </div>'
+        '      <div class="wgtb-panel wgtb-legend-panel">'
+        '        <div class="wgtb-panel-h">Legend</div>'
+        '        <div class="wgtb-legend-body"></div>'
+        '      </div>'
+        '    </aside>'
+        '  </div>'
+        f'  <footer class="wgtb-footer">{footer_html}</footer>'
+        '</div>'
+    )
+
+    wiring = (
+        "<script>\n"
+        "(function () {\n"
+        f"  var MAP = {map_name};\n"
+        f"  var LAYERS = {{ gap: {layer_js['gap']}, access: {layer_js['access']}, "
+        f"need: {layer_js['need']} }};\n"
+        f"  var TT = {tooltip_js};\n"
+        f"  var LEGENDS = {json.dumps(legends)};\n"
+        "  var body = document.querySelector('.wgtb-legend-body');\n"
+        "  function showLayer(k) {\n"
+        "    Object.keys(LAYERS).forEach(function (name) {\n"
+        "      var lyr = LAYERS[name];\n"
+        "      if (!lyr) return;\n"
+        "      if (name === k) { if (!MAP.hasLayer(lyr)) lyr.addTo(MAP); }\n"
+        "      else if (MAP.hasLayer(lyr)) { MAP.removeLayer(lyr); }\n"
+        "    });\n"
+        "    if (TT && MAP.hasLayer(TT) && TT.bringToFront) TT.bringToFront();\n"
+        "    document.querySelectorAll('.wgtb-layer').forEach(function (b) {\n"
+        "      b.classList.toggle('is-active', b.getAttribute('data-layer') === k);\n"
+        "    });\n"
+        "    if (body) body.innerHTML = LEGENDS[k] || '';\n"
+        "  }\n"
+        "  document.querySelectorAll('.wgtb-layer').forEach(function (b) {\n"
+        "    b.addEventListener('click', function () { showLayer(b.getAttribute('data-layer')); });\n"
+        "  });\n"
+        "  var zi = document.querySelector('.wgtb-zoom-in');\n"
+        "  var zo = document.querySelector('.wgtb-zoom-out');\n"
+        "  if (zi) zi.addEventListener('click', function () { MAP.zoomIn(); });\n"
+        "  if (zo) zo.addEventListener('click', function () { MAP.zoomOut(); });\n"
+        "  // Pen the view to the GTA. The zoom-out floor is 'all of Toronto just fits\n"
+        "  // the viewport' -- recomputed from the actual data bounds on load + resize\n"
+        "  // (getBoundsZoom), so a phone floors lower than a wide desktop and neither\n"
+        "  // can shrink the map past the coloured extent. maxBounds blocks panning it\n"
+        "  // off-screen.\n"
+        f"  var TO_BOUNDS = L.latLngBounds([[{data_bounds[1]}, {data_bounds[0]}], "
+        f"[{data_bounds[3]}, {data_bounds[2]}]]);\n"
+        "  MAP.options.maxBoundsViscosity = 0.5;\n"
+        "  MAP.setMaxBounds([[43.25, -80.45], [44.20, -78.20]]);\n"
+        "  function clampMinZoom() {\n"
+        "    MAP.invalidateSize();\n"
+        "    var z = MAP.getBoundsZoom(TO_BOUNDS, false);\n"
+        "    MAP.setMinZoom(Math.max(10, Math.min(z, 12)));\n"
+        "  }\n"
+        "  showLayer('gap');\n"
+        "  setTimeout(clampMinZoom, 200);\n"
+        "  window.addEventListener('resize', clampMinZoom);\n"
+        "})();\n"
+        "</script>\n"
+    )
+    return scaffold, wiring
+
+
+def _swatch_bar(colors: list[str]) -> str:
+    segs = "".join(f'<span style="background:{c}"></span>' for c in colors)
+    return f'<div class="wgtb-legend-bar">{segs}</div>'
 
 
 def main() -> int:
@@ -171,22 +479,27 @@ def main() -> int:
     gdf["tt_noncar"] = gdf["non_car_commute_pct"].map(lambda v: _fmt(v, ".1f") + "%")
     gdf["tt_dens"] = gdf["population_density"].map(lambda v: _fmt(v, ",.0f"))
 
+    data_bounds = tuple(round(float(v), 4) for v in gdf.total_bounds)  # (minlon, minlat, maxlon, maxlat), EPSG:4326
+
     gap_abs = float(np.abs(gdf["equity_gap"]).max())
+    gap_min = float(gdf["equity_gap"].min())
+    gap_max = float(gdf["equity_gap"].max())
     acc_max = float(gdf["access_score"].max())
     need_max = float(gdf["need_score"].max())
 
     # ---- base map ----
-    # tiles=None + explicit control=False TileLayers: otherwise folium files the
-    # basemap as a base layer too, and the radio group (see below) would let the
-    # user switch the map background off.
+    # tiles=None + explicit control=False TileLayers: keeps the basemap out of any
+    # layer group. zoom_control=False: folium's default topleft zoom is removed --
+    # the custom .wgtb-zoom pill (bottom-right, inside the map panel) replaces it.
+    # min_zoom=10 + a GTA maxBounds: the user can't shrink the map past "all of
+    # Toronto + a GTA margin (Mississauga .. Oshawa)" in view, and can't pan off it.
     m = folium.Map(
         location=TORONTO_CENTER,
         zoom_start=DEFAULT_ZOOM,
+        min_zoom=10,
         tiles=None,
-        control_scale=True,
-        # default Leaflet attribution box sits under our footer; all credits
-        # (data licences + basemap) are in the footer instead.
-        attributionControl=False,
+        zoom_control=False,
+        attributionControl=False,   # all credits live in the custom footer
     )
     folium.TileLayer(
         tiles=ESRI_BASE_URL, attr=ESRI_ATTR, name="basemap",
@@ -194,11 +507,6 @@ def main() -> int:
     ).add_to(m)
 
     # ---- colour scales (branca colormaps, used ONLY to colour the polygons) ----
-    # Diverging, symmetric about 0: negative = over-served (blue), positive = underserved (red).
-    YLORRD = ["#ffffcc", "#ffeda0", "#fed976", "#feb24c", "#fd8d3c",
-              "#fc4e2a", "#e31a1c", "#bd0026", "#800026"]
-    GAP_COLORS = ["#4575b4", "#91bfdb", "#e0f3f8", "#fee090", "#fc8d59", "#d73027"]
-
     gap_bin = round(gap_abs + 0.02, 2)  # pad so the extreme value sits inside the outer bin
     gap_bins = [round(x, 4) for x in np.linspace(-gap_bin, gap_bin, 7)]
     gap_cmap = cm.StepColormap(GAP_COLORS, vmin=-gap_bin, vmax=gap_bin, index=gap_bins)
@@ -210,45 +518,46 @@ def main() -> int:
             v = feat["properties"][col]
             return {
                 "fillColor": cmap(v) if v is not None else "#cccccc",
-                "color": "#555555",
+                "color": "#6b6486",
                 "weight": 0.5,
-                "fillOpacity": 0.72,
+                "fillOpacity": 0.78,
             }
         return style_function
 
-    # ---- three choropleth layers, radio-select (overlay=False) ----
-    # We hand-roll the fill + legend (folium.GeoJson + branca colormap) rather than
-    # folium.Choropleth: Choropleth's d3 legend has a selector bug when several sit on
-    # one map (every SVG lands in the first legend box), and it will not centre a
-    # diverging ramp on 0. Same visual result, full control of the diverging domain.
+    # ---- three choropleth layers ----
+    # Hand-rolled folium.GeoJson + branca colormap (not folium.Choropleth: its d3
+    # legend misbehaves with several on one map and will not centre a diverging
+    # ramp on 0). control=False + show only the default: the custom Layers panel
+    # adds/removes these; folium's LayerControl is not used at all.
     layers = [
-        ("Transit Equity Gap", "equity_gap", gap_cmap, True),
-        ("Transit Access", "access_score", acc_cmap, False),
-        ("Need", "need_score", need_cmap, False),
+        ("gap", "equity_gap", gap_cmap, True),
+        ("access", "access_score", acc_cmap, False),
+        ("need", "need_score", need_cmap, False),
     ]
-    layer_names = {}
-    for name, col, cmap, show in layers:
+    layer_js: dict[str, str] = {}
+    for key, col, cmap, show in layers:
         gj = folium.GeoJson(
             gdf.__geo_interface__,
-            name=name,
-            overlay=False,      # -> LayerControl treats these as a single-choice group
+            name=key,
+            control=False,
             show=show,
             style_function=_style(cmap, col),
-            highlight_function=lambda _f: {"weight": 2, "color": "#111111", "fillOpacity": 0.9},
+            highlight_function=lambda _f: {"weight": 2, "color": C_ACTIVE_BORDER,
+                                           "fillOpacity": 0.9},
             smooth_factor=0.5,
         )
         gj.add_to(m)
-        layer_names[name] = gj.get_name()
+        layer_js[key] = gj.get_name()
 
     # Esri place-name labels. Leaflet keeps all tile layers in tilePane (below the
-    # SVG overlayPane), so these sit *under* the choropleth, but the 0.72 fill
-    # opacity lets major labels (Toronto, North York, Scarborough, …) read through.
+    # SVG overlayPane), so these sit *under* the choropleth, but the fill opacity
+    # lets major labels (Toronto, North York, Scarborough, ...) read through.
     folium.TileLayer(
         tiles=ESRI_REF_URL, attr=ESRI_ATTR, name="labels",
         control=False, max_zoom=16, overlay=True,
     ).add_to(m)
 
-    # ---- one always-on transparent tooltip layer on top ----
+    # ---- one always-on transparent tooltip layer on top (UNCHANGED) ----
     tooltip = GeoJsonTooltip(
         fields=["AREA_NAME", "tt_gap", "tt_access", "tt_need", "tt_stops",
                 "tt_freq", "tt_lowinc", "tt_noncar", "tt_dens"],
@@ -260,119 +569,90 @@ def main() -> int:
         sticky=True,
         labels=True,
         style=(
-            "background-color:#ffffff; color:#222; font-family:system-ui,sans-serif; "
+            "background-color:#ffffff; color:#222; font-family:'Noto Sans', sans-serif; "
             "font-size:12px; padding:8px 10px; border:1px solid #bbb; border-radius:4px; "
             "box-shadow:0 1px 4px rgba(0,0,0,0.25);"
         ),
     )
-    folium.GeoJson(
+    tt_gj = folium.GeoJson(
         gdf.__geo_interface__,
         name="Neighbourhood details (hover)",
         control=False,          # always on, not a toggle
         style_function=lambda _f: {"fillColor": "#000000", "color": "#000000",
                                    "weight": 0, "fillOpacity": 0},
-        highlight_function=lambda _f: {"weight": 2.5, "color": "#111111", "fillOpacity": 0.06},
+        highlight_function=lambda _f: {"weight": 2.5, "color": C_ACTIVE_BORDER,
+                                       "fillOpacity": 0.06},
         tooltip=tooltip,
         smooth_factor=0.5,
-    ).add_to(m)
-
-    folium.LayerControl(collapsed=False).add_to(m)
-
-    # ---- one legend per layer; JS shows only the active layer's legend ----
-    def _bar(colors):
-        segs = "".join(
-            f"<span style='flex:1 1 0;height:14px;background:{c};'></span>" for c in colors
-        )
-        return (f"<span style='display:flex;width:190px;border:1px solid #999;'>"
-                f"{segs}</span>")
-
-    def _legend(lid, title, colors, left, mid, right, note, shown):
-        mid_html = (f"<span style='flex:1;text-align:center;'>{mid}</span>"
-                    if mid is not None else "")
-        return (
-            f"<div id='{lid}' class='wgtb-legend' style=\"display:{'block' if shown else 'none'};"
-            "position:fixed; right:12px; bottom:34px; z-index:9999; "
-            "background:rgba(255,255,255,0.94); border:1px solid #bbb; border-radius:5px; "
-            "padding:7px 10px; font-family:system-ui,sans-serif; font-size:11px; color:#222;\">"
-            f"<div style='font-weight:700; margin-bottom:4px;'>{title}</div>"
-            f"{_bar(colors)}"
-            "<div style='display:flex; width:190px; font-size:10px; margin-top:2px;'>"
-            f"<span style='flex:1;'>{left}</span>{mid_html}"
-            f"<span style='flex:1; text-align:right;'>{right}</span></div>"
-            f"<div style='font-size:10px; color:#555; margin-top:3px; max-width:190px;'>{note}</div>"
-            "</div>"
-        )
-
-    slug = {"Transit Equity Gap": "gap", "Transit Access": "access", "Need": "need"}
-    legends_html = (
-        _legend("wgtb-legend-gap", "Transit equity gap (need − access)",
-                GAP_COLORS, f"{-gap_bin:+.2f}", "0", f"{gap_bin:+.2f}",
-                "Blue = better served than need suggests · Red = underserved", True)
-        + _legend("wgtb-legend-access", "Transit access score",
-                  YLORRD, "0.00", None, f"{acc_max:.2f}",
-                  "Stop density + capacity-weighted peak frequency (incl. 500 m rapid-transit walkshed). Higher = better served.", False)
-        + _legend("wgtb-legend-need", "Transit need score",
-                  YLORRD, "0.00", None, f"{need_max:.2f}",
-                  "Mean of low-income share, non-car-commute share, population density. Higher = more transit-dependent.", False)
     )
-    m.get_root().html.add_child(folium.Element(legends_html))
+    tt_gj.add_to(m)
 
-    # Show only the active layer's legend. A MacroElement (not a bare script child)
-    # so folium renders this INSIDE the map's script block, after the layers/control
-    # exist -- a plain figure-level script would run before `map_...` is defined.
-    class LegendToggle(MacroElement):
-        _template = Template(
-            "{% macro script(this, kwargs) %}\n"
-            "var __slug = " + json.dumps(slug) + ";\n"
-            "function __showLegend(nm){\n"
-            "  document.querySelectorAll('.wgtb-legend').forEach(function(d){d.style.display='none';});\n"
-            "  var el = document.getElementById('wgtb-legend-'+(__slug[nm]||nm));\n"
-            "  if(el) el.style.display='block';\n"
-            "}\n"
-            "{{ this._parent.get_name() }}.on('baselayerchange', function(e){ __showLegend(e.name); });\n"
-            "{% endmacro %}"
-        )
+    # ---- legend fragments (one per layer; the custom JS swaps them) ----
+    legends = {
+        "gap": (
+            _swatch_bar(GAP_COLORS)
+            + '<div class="wgtb-legend-ends">'
+            f'<span>{gap_min:+.2f}</span><span>0</span><span>{gap_max:+.2f}</span></div>'
+            f'<div class="wgtb-legend-key"><i style="background:{GAP_KEY_BLUE}"></i>'
+            '<span>Blue: access exceeds need</span></div>'
+            f'<div class="wgtb-legend-key"><i style="background:{GAP_KEY_PINK}"></i>'
+            '<span>Pink: underserved relative to need</span></div>'
+        ),
+        "access": (
+            _swatch_bar(YLORRD)
+            + '<div class="wgtb-legend-ends">'
+            f'<span>0.00</span><span>{acc_max:.2f}</span></div>'
+            '<div class="wgtb-legend-note">Stop density + capacity-weighted peak '
+            'frequency (incl. 500 m rapid-transit walkshed). Higher = better served.</div>'
+        ),
+        "need": (
+            _swatch_bar(YLORRD)
+            + '<div class="wgtb-legend-ends">'
+            f'<span>0.00</span><span>{need_max:.2f}</span></div>'
+            '<div class="wgtb-legend-note">Mean of low-income share, non-car-commute '
+            'share, population density. Higher = more transit-dependent.</div>'
+        ),
+    }
 
-    m.add_child(LegendToggle())
-
-    # ---- title card + licence footer (plain HTML on the page) ----
-    title_html = (
-        "<div style=\"position:fixed; top:12px; left:50px; z-index:9999; "
-        "background:rgba(255,255,255,0.92); padding:8px 14px; border:1px solid #bbb; "
-        "border-radius:5px; font-family:system-ui,sans-serif; max-width:420px;\">"
-        "<div style=\"font-size:15px; font-weight:700;\">Who Gets the Bus?</div>"
-        "<div style=\"font-size:12px; color:#444;\">Toronto transit equity gap by "
-        "neighbourhood &mdash; need minus access, weekday morning peak. "
-        "Toggle layers at right; hover any neighbourhood for detail.</div></div>"
-    )
-    footer_html = (
-        "<div style=\"position:fixed; bottom:0; left:0; right:0; z-index:9999; "
-        "background:rgba(255,255,255,0.92); border-top:1px solid #bbb; padding:4px 10px; "
-        "font-family:system-ui,sans-serif; font-size:10.5px; color:#333; line-height:1.35;\">"
-        f"{LICENCE_HTML}</div>"
-    )
-    m.get_root().html.add_child(folium.Element(title_html))
-    m.get_root().html.add_child(folium.Element(footer_html))
-
+    # ---- render, then wrap folium's output in the dark-UI shell ----
     os.makedirs(os.path.dirname(OUT_HTML), exist_ok=True)
     html = m.get_root().render()
+
+    map_name = m.get_name()
+    scaffold, wiring = build_shell(
+        map_name, layer_js, tt_gj.get_name(), legends, LICENCE_HTML, data_bounds
+    )
+
+    # 1. font + shell CSS into <head> (last, so it wins over folium's rules)
+    head_inject = f'<link rel="stylesheet" href="{GOOGLE_FONT_URL}">\n{SHELL_CSS}\n'
+    html = html.replace("</head>", head_inject + "</head>", 1)
+
+    # 2. replace the bare folium-map div with the scaffold that embeds it
+    html, n = re.subn(r'<div class="folium-map" id="[^"]+"\s*></div>', scaffold, html, count=1)
+    assert n == 1, f"expected exactly one folium-map div, replaced {n}"
+
+    # 3. wiring JS after folium's trailing <script>
+    html = html.replace("</html>", wiring + "</html>", 1)
+
+    # 4. vendor the Google font, then every remaining CDN asset
+    html = vendor_google_font(html)
     html = inline_web_assets(html)
+
     with open(OUT_HTML, "w", encoding="utf-8") as fh:
         fh.write(html)
 
-    remaining = re.findall(r'(?:src|href)="(https?://(?![^"]*basemaps|[^"]*tile)[^"]+)"', html)
+    remaining = re.findall(
+        r'(?:src|href)="(https?://(?![^"]*basemaps|[^"]*tile|[^"]*leafletjs\.com)[^"]+)"', html
+    )
     if remaining:
-        print(f"  NOTE {len(remaining)} external ref(s) still linked: {remaining}")
+        print(f"  NOTE {len(remaining)} external ref(s) still linked: {sorted(set(remaining))}")
 
     size_kb = os.path.getsize(OUT_HTML) / 1024
     print(f"wrote {OUT_HTML}  ({size_kb:,.0f} KB)")
-    print(f"  layers        : {[n for n, *_ in layers]} (radio, 'Transit Equity Gap' default)")
-    print(f"  gap bins      : {gap_bins}  (symmetric, centered 0; |max gap| = {gap_abs:.3f})")
-    print(f"  access domain : 0 .. {acc_max:.3f}")
-    print(f"  need domain   : 0 .. {need_max:.3f}")
-    print(f"  tooltip fields: AREA_NAME, equity_gap, access_score, need_score, stop_count,")
-    print(f"                  total_effective_frequency, low_income_pct, non_car_commute_pct,")
-    print(f"                  population_density")
+    print(f"  layers        : Equity gap / Access / Need (custom control, 'Equity gap' default)")
+    print(f"  gap bins      : {gap_bins}  (symmetric, centred 0; |max gap| = {gap_abs:.3f})")
+    print(f"  legend ends   : gap {gap_min:+.2f}..{gap_max:+.2f} · access 0..{acc_max:.2f} · need 0..{need_max:.2f}")
+    print(f"  basemap       : Esri Dark Gray Canvas (keyless)")
     return 0
 
 
